@@ -1,0 +1,30 @@
+# Python/runtime
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Local application data and secrets
+downloads/
+subtitle_jobs/
+render_jobs/
+*.json
+cookies*.txt
+cookie*.txt
+
+# Build artifacts and generated binaries
+build/
+dist/
+release/
+.pyinstaller-build*/
+*.spec
+*.log
+
+# IDE/OS files
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
