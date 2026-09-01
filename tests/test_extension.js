@@ -95,7 +95,7 @@ async function testServiceWorkerReinjectsExistingColabTab() {
       },
       windows: { update: async () => {} },
       scripting: { executeScript: async () => { injectionCount += 1; } },
-      downloads: { download: async () => 1 },
+      downloads: { download: async () => 1, search: async () => [], onChanged: event() },
     },
   };
   vm.runInNewContext(fs.readFileSync("extension/service-worker.js", "utf8"), context);
@@ -112,12 +112,19 @@ testServiceWorkerReinjectsExistingColabTab()
   .then(() => {
     const sidepanel = fs.readFileSync("extension/sidepanel.js", "utf8");
     const styles = fs.readFileSync("extension/sidepanel.css", "utf8");
+    const html = fs.readFileSync("extension/sidepanel.html", "utf8");
+    const canvasEditor = fs.readFileSync("extension/canvas-editor.js", "utf8");
     assert.match(sidepanel, /sidepanel\.html\?manualEditor=1/);
     assert.match(sidepanel, /chrome\.tabs\.create\(\{ url, active: true \}\)/);
     assert.match(sidepanel, /isManualEditorPage/);
     assert.match(sidepanel, /existing\.jobId === state\.jobId/);
     assert.match(sidepanel, /\{ active: true, url \}/);
     assert.match(styles, /body\.manual-editor-page #canvas-wrap/);
+    assert.match(html, /id="toggle-preview"/);
+    assert.match(html, /id="preview-seek"/);
+    assert.match(sidepanel, /\/preview-token/);
+    assert.match(sidepanel, /DOWNLOAD_PROGRESS/);
+    assert.match(canvasEditor, /fitDisplay\(\)/);
     console.log("Extension automation tests passed.");
   })
   .catch((error) => { console.error(error); process.exitCode = 1; });

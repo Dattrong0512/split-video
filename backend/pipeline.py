@@ -204,12 +204,14 @@ def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
         prompt = (
             "Chỉ dùng âm thanh đính kèm để sửa transcript tiếng Trung và dịch; không suy đoán từ hình ảnh, "
             "không bịa hoặc thêm ý không có trong lời nói. Giữ nguyên từng id, không bỏ, thêm, gộp hay tách cue. "
-            "Bản dịch tiếng Việt phải đúng nghĩa, tự nhiên, viết hoa kiểu câu bình thường và đủ ngắn để đọc trong "
-            "duration_seconds; ưu tiên rút gọn mà không mất ý. Gán người nói nhất quán S1, S2... và chỉ suy đoán "
+            "Bản dịch tiếng Việt phải đúng nghĩa, tự nhiên, viết hoa kiểu câu bình thường, đủ ngắn để đọc trong "
+            "duration_seconds và không vượt quá max_vi_characters; ưu tiên rút gọn mà không mất ý. "
+            "Gán người nói nhất quán S1, S2... và chỉ suy đoán "
             "giới tính khi nghe đủ rõ. Dữ liệu cue: " +
             json.dumps([{
                 "id": cue["id"], "start_seconds": round(cue["start"], 3),
                 "end_seconds": round(cue["end"], 3), "duration_seconds": round(cue["end"] - cue["start"], 3),
+                "max_vi_characters": max(6, round((cue["end"] - cue["start"]) * 14)),
                 "whisper_transcript": cue["original"],
             } for cue in cues], ensure_ascii=False)
         )
@@ -435,6 +437,16 @@ def plan_dubbing_timeline(cues: list[dict], generated_durations: list[float], vi
         end = start + generated / speed
         timeline.append({"start": start, "end": end, "speed": speed})
         cursor = end + gap
+    if timeline and timeline[-1]["end"] > video_duration:
+        compacted = [dict(item) for item in timeline]
+        latest_end = video_duration
+        for item in reversed(compacted):
+            speech_duration = item["end"] - item["start"]
+            item["end"] = min(item["end"], latest_end)
+            item["start"] = item["end"] - speech_duration
+            latest_end = item["start"] - gap
+        if compacted[0]["start"] >= 0:
+            timeline = compacted
     return timeline
 
 
@@ -535,7 +547,7 @@ def write_ass(path: Path, cues: list[dict], rect, dimensions: tuple[int, int] = 
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8-sig")
 
 
-def video_filter(regions: list, ass_path: Path) -> str:
+def video_filter(regions: list, ass_path: Path, subtitle_rect=None) -> str:
     parts = []; current = "0:v"
     for index, rect in enumerate(regions):
         base, crop, blur, out = f"base{index}", f"crop{index}", f"blur{index}", f"v{index}"
@@ -543,9 +555,42 @@ def video_filter(regions: list, ass_path: Path) -> str:
         parts.append(f"[{crop}]crop=iw*{rect.w:.7f}:ih*{rect.h:.7f}:iw*{rect.x:.7f}:ih*{rect.y:.7f},gblur=sigma=20:steps=3[{blur}]")
         parts.append(f"[{base}][{blur}]overlay=main_w*{rect.x:.7f}:main_h*{rect.y:.7f}[{out}]")
         current = out
+    if subtitle_rect is not None:
+        index = len(regions)
+        base, crop, blur, panel = f"panelbase{index}", f"panelcrop{index}", f"panelblur{index}", f"panel{index}"
+        parts.append(f"[{current}]split=2[{base}][{crop}]")
+        parts.append(
+            f"[{crop}]crop=iw*{subtitle_rect.w:.7f}:ih*{subtitle_rect.h:.7f}:"
+            f"iw*{subtitle_rect.x:.7f}:ih*{subtitle_rect.y:.7f},gblur=sigma=10:steps=2[{blur}]"
+        )
+        parts.append(
+            f"[{base}][{blur}]overlay=main_w*{subtitle_rect.x:.7f}:main_h*{subtitle_rect.y:.7f},"
+            f"drawbox=x=iw*{subtitle_rect.x:.7f}:y=ih*{subtitle_rect.y:.7f}:"
+            f"w=iw*{subtitle_rect.w:.7f}:h=ih*{subtitle_rect.h:.7f}:color=black@0.26:t=fill[{panel}]"
+        )
+        current = panel
     escaped = str(ass_path).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
     parts.append(f"[{current}]ass=filename='{escaped}'[vout]")
     return ";".join(parts)
+
+
+def audio_mix_filter(duration: float) -> str:
+    return (
+        f"[1:a]volume=0.92,atrim=0:{duration:.3f},asetpts=N/SR/TB[bg]"
+        f";[2:a]volume=1.15,atrim=0:{duration:.3f},asetpts=N/SR/TB[dub]"
+        f";[bg][dub]amix=inputs=2:duration=first:normalize=0,alimiter=limit=.95,"
+        f"atrim=0:{duration:.3f}[aout]"
+    )
+
+
+def encoding_options(dimensions: tuple[int, int], duration: float) -> list[str]:
+    maxrate = "3000k" if dimensions[0] * dimensions[1] <= 1_000_000 else "5000k"
+    bufsize = "6000k" if maxrate == "3000k" else "10000k"
+    return [
+        "-t", f"{duration:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+        "-maxrate", maxrate, "-bufsize", bufsize, "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+    ]
 
 
 def render_job(job: dict, request, voices: dict) -> None:
@@ -556,8 +601,9 @@ def render_job(job: dict, request, voices: dict) -> None:
     dimensions = job.get("video_size") or video_size(job["source"])
     ass = job["work_dir"] / "subtitles.ass"; write_ass(ass, job["cues"], request.subtitleRect, dimensions)
     result = job["work_dir"] / "result.mp4"
-    filters = video_filter(request.blurRegions, ass) + ";[1:a]volume=0.92[bg];[2:a]volume=1.15[dub];[bg][dub]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=.95[aout]"
+    duration = float(job["duration"])
+    filters = video_filter(request.blurRegions, ass, request.subtitleRect) + ";" + audio_mix_filter(duration)
     run([ffmpeg(), "-y", "-i", str(job["source"]), "-i", str(background), "-i", str(dubbing), "-filter_complex", filters,
-         "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-shortest", str(result)], "RENDER_FAILED")
+         "-map", "[vout]", "-map", "[aout]", *encoding_options(dimensions, duration), str(result)], "RENDER_FAILED")
     job["result"] = result
     update(job, 100, "Hoàn tất. Đang chuẩn bị tải xuống…", status="complete")

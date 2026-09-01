@@ -2,6 +2,7 @@ const NOTEBOOK_URL = "https://colab.research.google.com/github/Dattrong0512/spli
 const NOTEBOOK_PATH = "/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb";
 let openingColab = null;
 const pendingColabTabs = new Set();
+const activeDownloads = new Set();
 
 async function protectPrivateStorage() {
   await chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
@@ -35,6 +36,17 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => pendingColabTabs.delete(tabId));
+
+chrome.downloads.onChanged.addListener(async (delta) => {
+  if (!activeDownloads.has(delta.id)) return;
+  const [item] = await chrome.downloads.search({ id: delta.id }).catch(() => []);
+  if (!item) return;
+  chrome.runtime.sendMessage({
+    type: "DOWNLOAD_PROGRESS",
+    payload: { id: item.id, bytesReceived: item.bytesReceived, totalBytes: item.totalBytes, state: item.state },
+  }).catch(() => {});
+  if (item.state === "complete" || item.state === "interrupted") activeDownloads.delete(item.id);
+});
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const fromDubbingNotebook = sender.tab?.url?.startsWith("https://colab.research.google.com/") && sender.tab.url.includes(NOTEBOOK_PATH);
@@ -78,7 +90,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === "DOWNLOAD_RESULT") {
     chrome.downloads.download({ url: message.url, filename: message.filename, saveAs: false })
-      .then((downloadId) => sendResponse({ ok: true, downloadId }))
+      .then((downloadId) => { activeDownloads.add(downloadId); sendResponse({ ok: true, downloadId }); })
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }

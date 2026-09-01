@@ -7,7 +7,7 @@ if (isManualEditorPage) document.body.classList.add("manual-editor-page");
 const editor = new CanvasEditor($("#preview-canvas"));
 const state = {
   canonicalUrl: "", server: null, jobId: null, stage: "idle", blurMode: "auto",
-  clones: [], voices: [], analysis: null, pending: null, pollTimer: null, recoveryCount: 0,
+  clones: [], voices: [], analysis: null, pending: null, pollTimer: null, recoveryCount: 0, downloadId: null,
 };
 
 function setStatus(message, progress = null) {
@@ -19,6 +19,27 @@ function setBusy(busy) {
   $("#primary").disabled = busy;
   $("#cancel").hidden = !busy || !state.jobId;
   document.querySelectorAll("[data-blur-mode]").forEach((button) => { button.disabled = busy; });
+}
+
+function mediaTime(value) {
+  const seconds = Math.max(0, Number.isFinite(value) ? Math.floor(value) : 0);
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function updatePreviewControls() {
+  const video = $("#preview-video");
+  $("#preview-seek").value = String(video.currentTime || 0);
+  $("#preview-time").textContent = `${mediaTime(video.currentTime)} / ${mediaTime(video.duration)}`;
+  $("#toggle-preview").textContent = video.paused ? "▶ Phát video" : "❚❚ Tạm dừng";
+}
+
+async function setupVideoPreview() {
+  const preview = await serverFetch(`/api/jobs/${state.jobId}/preview-token`, { method: "POST" });
+  const video = $("#preview-video");
+  await editor.setVideo(video, preview.url);
+  $("#preview-seek").max = String(video.duration || 0);
+  $("#preview-controls").hidden = false;
+  updatePreviewControls();
 }
 
 function errorCode(error) {
@@ -240,12 +261,15 @@ async function applyAnalysis(analysis) {
     $("#primary").textContent = "Mở lại tab chỉnh khung";
     return;
   }
+  $("#editor-card").hidden = false;
   await editor.setImage(analysis.previewDataUrl);
   editor.setRegions(analysis.blurRegions, analysis.subtitleRect);
-  $("#editor-card").hidden = false;
+  let previewReady = true;
+  try { await setupVideoPreview(); }
+  catch (_) { previewReady = false; $("#preview-controls").hidden = true; }
   showSpeakers(analysis.speakers);
   setBusy(false);
-  setStatus("Đã phân tích. Chỉnh khung nếu cần, rồi bấm tạo video.", 55);
+  setStatus(previewReady ? "Đã phân tích. Phát/tua video, chỉnh khung rồi bấm tạo video." : "Đã phân tích nhưng không tải được video preview; vẫn có thể chỉnh trên ảnh tĩnh.", 55);
   $("#primary").textContent = "Tạo lồng tiếng & tải xuống";
 }
 
@@ -298,6 +322,7 @@ async function uploadClone(localId) {
 }
 
 async function render() {
+  $("#preview-video").pause();
   setBusy(true);
   setStatus("Đang chuẩn bị giọng đã chọn…", 58);
   try {
@@ -336,9 +361,11 @@ async function render() {
 async function downloadResult() {
   try {
     const result = await serverFetch(`/api/jobs/${state.jobId}/download-token`, { method: "POST" });
+    if (result.size) setStatus(`Đang tải video ${(result.size / 1024 / 1024).toFixed(1)} MB…`, 100);
     const response = await chrome.runtime.sendMessage({ type: "DOWNLOAD_RESULT", url: result.url, filename: result.filename });
     if (!response?.ok) throw new Error(response?.error);
-    setStatus("Hoàn tất. Chrome đang tải video đã lồng tiếng.", 100);
+    state.downloadId = response.downloadId;
+    setStatus(`Render xong. Chrome đang tải${result.size ? ` ${(result.size / 1024 / 1024).toFixed(1)} MB` : ""}…`, 100);
     state.stage = "complete";
     state.jobId = null;
     state.analysis = null;
@@ -453,6 +480,19 @@ document.querySelectorAll("[data-blur-mode]").forEach((button) => button.addEven
 $("#tool-blur").addEventListener("click", () => { editor.tool = "blur"; $("#tool-blur").classList.add("active"); $("#tool-subtitle").classList.remove("active"); });
 $("#tool-subtitle").addEventListener("click", () => { editor.tool = "subtitle"; $("#tool-subtitle").classList.add("active"); $("#tool-blur").classList.remove("active"); });
 $("#delete-region").addEventListener("click", () => editor.deleteSelected());
+$("#toggle-preview").addEventListener("click", async () => {
+  const video = $("#preview-video");
+  if (video.paused) await video.play(); else video.pause();
+  updatePreviewControls();
+});
+$("#preview-seek").addEventListener("input", (event) => {
+  const video = $("#preview-video");
+  video.currentTime = Number(event.target.value);
+  updatePreviewControls();
+});
+for (const eventName of ["timeupdate", "play", "pause", "ended", "durationchange"]) {
+  $("#preview-video").addEventListener(eventName, updatePreviewControls);
+}
 $("#add-clone").addEventListener("click", () => $("#clone-dialog").showModal());
 $("#delete-clone").addEventListener("click", async () => {
   const value = $("#default-voice").value;
@@ -491,6 +531,21 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "COLAB_PROGRESS_UPDATED" && state.pending) {
     setStatus(message.payload.message, message.payload.progress);
     if (message.payload.error) setBusy(false);
+  }
+  if (message?.type === "DOWNLOAD_PROGRESS" && message.payload?.id === state.downloadId) {
+    const { bytesReceived = 0, totalBytes = 0, state: downloadState } = message.payload;
+    const percent = totalBytes > 0 ? bytesReceived / totalBytes * 100 : 100;
+    if (downloadState === "complete") {
+      setStatus("Hoàn tất. Video đã tải xuống máy.", 100);
+      state.downloadId = null;
+    } else if (downloadState === "interrupted") {
+      setStatus("Tải video bị gián đoạn. Hãy thử lại.");
+      state.downloadId = null;
+    } else {
+      const received = (bytesReceived / 1024 / 1024).toFixed(1);
+      const total = totalBytes > 0 ? ` / ${(totalBytes / 1024 / 1024).toFixed(1)} MB` : " MB";
+      setStatus(`Đang tải ${received}${total}…`, percent);
+    }
   }
 });
 

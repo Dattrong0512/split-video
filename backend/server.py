@@ -27,7 +27,7 @@ JOBS: dict[str, dict] = {}
 VOICES: dict[str, dict] = {}
 LOCK = threading.RLock()
 
-app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.1.0", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.3.0", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
@@ -43,7 +43,11 @@ def authorize(authorization: str | None = Header(default=None)) -> None:
 
 
 def public_job(job: dict) -> dict:
-    return {key: value for key, value in job.items() if key not in {"gemini_key", "cookie_text", "download_token", "download_expires", "work_dir", "source", "cues", "result"}}
+    private = {
+        "gemini_key", "cookie_text", "download_token", "download_expires",
+        "preview_token", "preview_expires", "work_dir", "source", "cues", "result",
+    }
+    return {key: value for key, value in job.items() if key not in private}
 
 
 def fail_job(job_id: str, error: Exception) -> None:
@@ -146,6 +150,30 @@ def start_render(job_id: str, request: RenderRequest) -> dict:
     return {"ok": True}
 
 
+@app.post("/api/jobs/{job_id}/preview-token", dependencies=[Depends(authorize)])
+def create_preview_token(job_id: str) -> dict:
+    job = JOBS.get(job_id)
+    source_value = job.get("source") if job else None
+    source = Path(source_value) if source_value else None
+    if not job or job.get("status") not in {"analysis_ready", "queued_render", "rendering", "complete"} or not source or not source.exists():
+        raise HTTPException(status_code=409, detail={"code": "PREVIEW_NOT_READY", "message": "Video xem trước chưa sẵn sàng."})
+    token = secrets.token_urlsafe(24)
+    job["preview_token"] = token
+    job["preview_expires"] = time.time() + 7200
+    return {"url": f"{PUBLIC_URL}/api/previews/{job_id}?token={token}"}
+
+
+@app.get("/api/previews/{job_id}")
+def preview_video(job_id: str, token: str):
+    job = JOBS.get(job_id)
+    if not job or token != job.get("preview_token") or time.time() > job.get("preview_expires", 0):
+        raise HTTPException(status_code=403, detail="Liên kết xem trước không hợp lệ hoặc đã hết hạn.")
+    return FileResponse(
+        job["source"], media_type="video/mp4", filename="preview.mp4",
+        content_disposition_type="inline", headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
 @app.post("/api/jobs/{job_id}/cancel", dependencies=[Depends(authorize)])
 def cancel_job(job_id: str) -> dict:
     job = JOBS.get(job_id)
@@ -158,13 +186,18 @@ def cancel_job(job_id: str) -> dict:
 @app.post("/api/jobs/{job_id}/download-token", dependencies=[Depends(authorize)])
 def create_download_token(job_id: str) -> dict:
     job = JOBS.get(job_id)
-    if not job or job.get("status") != "complete" or not Path(job.get("result", "")).exists():
+    result_value = job.get("result") if job else None
+    result = Path(result_value) if result_value else None
+    if not job or job.get("status") != "complete" or not result or not result.exists():
         raise HTTPException(status_code=409, detail={"code": "RESULT_NOT_READY", "message": "Video chưa sẵn sàng."})
     token = secrets.token_urlsafe(24)
     job["download_token"] = token
     job["download_expires"] = time.time() + 600
     video_id = job["canonical_url"].rsplit("/", 1)[-1]
-    return {"url": f"{PUBLIC_URL}/api/results/{job_id}?token={token}", "filename": f"douyin_{video_id}_vi_dub.mp4"}
+    return {
+        "url": f"{PUBLIC_URL}/api/results/{job_id}?token={token}",
+        "filename": f"douyin_{video_id}_vi_dub.mp4", "size": result.stat().st_size,
+    }
 
 
 def cleanup_job(job_id: str) -> None:
@@ -173,12 +206,17 @@ def cleanup_job(job_id: str) -> None:
         shutil.rmtree(job["work_dir"], ignore_errors=True)
 
 
+def schedule_cleanup_job(job_id: str) -> None:
+    timer = threading.Timer(300, cleanup_job, args=(job_id,))
+    timer.daemon = True
+    timer.start()
+
+
 @app.get("/api/results/{job_id}")
 def download_result(job_id: str, token: str, background_tasks: BackgroundTasks):
     job = JOBS.get(job_id)
     if not job or token != job.get("download_token") or time.time() > job.get("download_expires", 0):
         raise HTTPException(status_code=403, detail="Liên kết tải không hợp lệ hoặc đã hết hạn.")
-    job["download_token"] = None
-    background_tasks.add_task(cleanup_job, job_id)
+    background_tasks.add_task(schedule_cleanup_job, job_id)
     video_id = job["canonical_url"].rsplit("/", 1)[-1]
     return FileResponse(job["result"], media_type="video/mp4", filename=f"douyin_{video_id}_vi_dub.mp4", background=background_tasks)

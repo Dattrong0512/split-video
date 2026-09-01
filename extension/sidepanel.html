@@ -28,9 +28,10 @@
     </section>
     <section id="editor-card" class="card" hidden>
       <div class="section-title"><span>Một khung chỉnh sửa</span><span>Blur + subtitle</span></div>
-      <div id="canvas-wrap"><canvas id="preview-canvas"></canvas></div>
+      <div id="canvas-wrap"><video id="preview-video" preload="metadata" playsinline hidden></video><canvas id="preview-canvas"></canvas></div>
+      <div id="preview-controls" class="preview-controls" hidden><button id="toggle-preview" type="button">▶ Phát video</button><input id="preview-seek" type="range" min="0" max="0" step="0.01" value="0"><span id="preview-time">0:00 / 0:00</span></div>
       <div class="editor-tools"><button id="tool-blur" class="active">Vùng blur</button><button id="tool-subtitle">Khung subtitle</button><button id="delete-region" class="danger">Xóa vùng chọn</button></div>
-      <small>Kéo để tạo khung. Có thể tạo nhiều vùng blur; subtitle chỉ dùng một khung xanh.</small>
+      <small>Phát hoặc kéo timeline tới frame có chữ, rồi vẽ khung. Khung subtitle xanh có nền mờ nhẹ; có thể tạo nhiều vùng blur màu hồng.</small>
     </section>
     <section class="card status-card"><div class="progress"><i id="progress-bar"></i></div><p id="status">Sẵn sàng.</p><button id="primary" class="primary">Tải & lồng tiếng</button><button id="cancel" class="secondary full" hidden>Hủy</button></section>
   </main>

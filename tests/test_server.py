@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 
@@ -63,9 +65,29 @@ class ServerContractTest(unittest.TestCase):
     def test_public_job_never_returns_credentials(self):
         public = server.public_job({
             "id": "job", "gemini_key": "secret-key", "cookie_text": "secret-cookie",
-            "download_token": "secret-token", "message": "ok",
+            "download_token": "secret-token", "preview_token": "preview-secret", "message": "ok",
         })
         self.assertEqual(public, {"id": "job", "message": "ok"})
+
+    def test_preview_supports_http_byte_ranges_for_seeking(self):
+        job_id = "preview-range-test"
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            source.write_bytes(b"0123456789")
+            server.JOBS[job_id] = {
+                "id": job_id, "status": "analysis_ready", "source": source,
+                "canonical_url": "https://www.douyin.com/video/7671977232314797347",
+            }
+            try:
+                created = self.client.post(f"/api/jobs/{job_id}/preview-token", headers=self.auth)
+                self.assertEqual(created.status_code, 200)
+                url = created.json()["url"].removeprefix(server.PUBLIC_URL)
+                preview = self.client.get(url, headers={"Range": "bytes=2-5"})
+                self.assertEqual(preview.status_code, 206)
+                self.assertEqual(preview.content, b"2345")
+                self.assertEqual(preview.headers.get("accept-ranges"), "bytes")
+            finally:
+                server.JOBS.pop(job_id, None)
 
 
 if __name__ == "__main__":

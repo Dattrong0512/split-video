@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 
 from backend.pipeline import (
     DEFAULT_GEMINI_MODEL, PipelineError, _apply_translation_rows, _atempo, _gemini_retry_options,
-    _translation_schema, _v3_ocr_boxes,
-    cluster_rectangles, ensure_portrait_subtitle_blur, plan_dubbing_timeline, transcribe, write_ass,
+    _translation_schema, _v3_ocr_boxes, audio_mix_filter, cluster_rectangles, encoding_options,
+    ensure_portrait_subtitle_blur, plan_dubbing_timeline, transcribe, video_filter, write_ass,
 )
 
 
@@ -122,6 +122,14 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(timeline[0]["speed"], 1.0)
         self.assertAlmostEqual(timeline[1]["speed"], 1.15)
 
+    def test_overflowing_cues_compact_into_pauses_before_video_end(self):
+        cues = [{"start": 1, "end": 2}, {"start": 4, "end": 4.5}]
+        timeline = plan_dubbing_timeline(cues, [2, 2], 5)
+        self.assertLessEqual(timeline[-1]["end"], 5)
+        self.assertGreaterEqual(timeline[0]["start"], 0)
+        self.assertGreaterEqual(timeline[1]["start"], timeline[0]["end"] + .04 - 1e-9)
+        self.assertTrue(all(item["speed"] <= 1.15 for item in timeline))
+
     def test_ass_uses_portrait_resolution_clean_font_and_wraps(self):
         rect = SimpleNamespace(x=.08, y=.78, w=.84, h=.16)
         cues = [{"start": 1, "end": 2.4, "text_vi": "Đây là một câu tiếng Việt khá dài cần được ngắt dòng gọn gàng và dễ đọc."}]
@@ -134,6 +142,21 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertIn(",1,2,1,2,", content)
         self.assertNotIn("DejaVu Sans", content)
         self.assertIn("\\N", content)
+
+    def test_subtitle_rect_gets_blurred_translucent_panel(self):
+        rect = SimpleNamespace(x=.1, y=.4, w=.8, h=.16)
+        filters = video_filter([], Path("subtitles.ass"), rect)
+        self.assertIn("gblur=sigma=10:steps=2", filters)
+        self.assertIn("color=black@0.26:t=fill", filters)
+
+    def test_render_audio_and_container_are_limited_to_source_duration(self):
+        filters = audio_mix_filter(74.1)
+        self.assertIn("amix=inputs=2:duration=first", filters)
+        self.assertEqual(filters.count("atrim=0:74.100"), 3)
+        options = encoding_options((720, 1280), 74.1)
+        self.assertEqual(options[options.index("-t") + 1], "74.100")
+        self.assertEqual(options[options.index("-maxrate") + 1], "3000k")
+        self.assertEqual(options[options.index("-b:a") + 1], "128k")
 
 
 if __name__ == "__main__":
