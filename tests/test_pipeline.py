@@ -263,6 +263,11 @@ class PipelineHelpersTest(unittest.TestCase):
                 self.assertTrue(job["review_result"].exists())
                 self.assertNotIn("result", job)
                 self.assertAlmostEqual(media_duration(job["review_result"]), 2.0, places=1)
+                first_review = job["review_result"]
+                request.speechRate = 1.2
+                render_job(job, request, {})
+                self.assertNotEqual(job["review_result"], first_review)
+                self.assertTrue(first_review.exists())
                 request.previewOnly = False
                 render_job(job, request, {})
             self.assertEqual(job["status"], "complete")

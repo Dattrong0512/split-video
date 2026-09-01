@@ -170,6 +170,11 @@ testServiceWorkerReinjectsExistingColabTab()
     assert.match(sidepanel, /\/review-token/);
     assert.match(sidepanel, /previewOnly/);
     assert.match(sidepanel, /speechRate/);
+    assert.match(sidepanel, /speechRate \/ state\.previewRate/);
+    assert.match(sidepanel, /preservesPitch = true/);
+    assert.match(sidepanel, /addEventListener\("change", commitAuditionedSpeechRate\)/);
+    assert.match(sidepanel, /immutableReviews/);
+    assert.match(sidepanel, /if \(!previewOnly \|\| !state\.immutableReviews\) \$\("#review-video"\)\.pause\(\)/);
     assert.match(sidepanel, /DOWNLOAD_PROGRESS/);
     assert.match(canvasEditor, /fitDisplay\(\)/);
     console.log("Extension automation tests passed.");

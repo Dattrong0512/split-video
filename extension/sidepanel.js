@@ -8,7 +8,7 @@ const editor = new CanvasEditor($("#preview-canvas"));
 const state = {
   canonicalUrl: "", server: null, jobId: null, stage: "idle", blurMode: "auto",
   clones: [], voices: [], analysis: null, pending: null, pollTimer: null, recoveryCount: 0, downloadId: null,
-  speechRate: 1, previewRate: null, uploadedClones: {},
+  speechRate: 1, previewRate: null, immutableReviews: false, uploadedClones: {},
 };
 
 function setStatus(message, progress = null) {
@@ -53,6 +53,9 @@ function showSpeedCard() {
 async function showDubbingReview() {
   const review = await serverFetch(`/api/jobs/${state.jobId}/review-token`, { method: "POST" });
   const video = $("#review-video");
+  video.defaultPlaybackRate = 1;
+  video.playbackRate = 1;
+  video.preservesPitch = true;
   video.src = review.url;
   video.hidden = false;
   video.load();
@@ -71,11 +74,43 @@ function invalidateDubbingReview() {
   if (!state.jobId || !["ready", "preview_ready"].includes(state.stage)) return;
   state.previewRate = null;
   state.stage = "ready";
-  $("#review-video").pause();
-  $("#review-video").hidden = true;
+  const video = $("#review-video");
+  video.pause();
+  video.defaultPlaybackRate = 1;
+  video.playbackRate = 1;
+  video.hidden = true;
   $("#primary").textContent = "Tạo lại preview 30 giây";
   setStatus(`Tốc độ ${state.speechRate.toFixed(2)}× chưa được preview. Hãy tạo lại 30 giây để nghe thử.`, 55);
   persistJob().catch(() => {});
+}
+
+function auditionSpeechRate() {
+  if (!state.jobId || !["ready", "preview_ready"].includes(state.stage)) return;
+  const video = $("#review-video");
+  if (video.hidden || !Number.isFinite(state.previewRate) || state.previewRate <= 0) {
+    invalidateDubbingReview();
+    return;
+  }
+  const liveRate = Math.max(.25, Math.min(4, state.speechRate / state.previewRate));
+  video.defaultPlaybackRate = liveRate;
+  video.playbackRate = liveRate;
+  video.preservesPitch = true;
+  if (video.ended) video.currentTime = 0;
+  video.play().catch(() => {});
+  if (Math.abs(state.speechRate - state.previewRate) <= .001) {
+    state.stage = "preview_ready";
+    $("#primary").textContent = "Dùng tốc độ này & tải toàn bộ";
+    setStatus(`Preview chính xác ở tốc độ ${state.previewRate.toFixed(2)}× đã sẵn sàng.`, 100);
+    return;
+  }
+  state.stage = "ready";
+  $("#primary").textContent = "Áp dụng chính xác tốc độ này";
+  setStatus(`Đang nghe tức thì ở ${state.speechRate.toFixed(2)}×. Thả thanh để tự tạo preview chính xác.`, 100);
+}
+
+function commitAuditionedSpeechRate() {
+  if (state.stage !== "ready" || $("#review-video").hidden || !Number.isFinite(state.previewRate)) return;
+  render(true);
 }
 
 function errorCode(error) {
@@ -118,7 +153,11 @@ async function checkServer(retries = 2) {
   let lastError;
   for (let attempt = 0; attempt < retries; attempt += 1) {
     state.server = candidate;
-    try { return await serverFetch("/api/health", { signal: AbortSignal.timeout(8000) }); }
+    try {
+      const health = await serverFetch("/api/health", { signal: AbortSignal.timeout(8000) });
+      state.immutableReviews = Boolean(health.immutableReviews);
+      return health;
+    }
     catch (error) { lastError = error; }
   }
   state.server = null;
@@ -372,7 +411,7 @@ async function render(previewOnly) {
     return;
   }
   $("#preview-video").pause();
-  $("#review-video").pause();
+  if (!previewOnly || !state.immutableReviews) $("#review-video").pause();
   setBusy(true);
   setStatus(previewOnly ? "Đang tạo bản nghe thử 30 giây…" : "Đang xuất toàn bộ video với tốc độ đã chọn…", 58);
   try {
@@ -542,8 +581,9 @@ document.querySelectorAll("[data-blur-mode]").forEach((button) => button.addEven
 $("#speech-rate").addEventListener("input", (event) => {
   state.speechRate = Number(event.target.value);
   $("#speech-rate-value").textContent = `${state.speechRate.toFixed(2)}×`;
-  invalidateDubbingReview();
+  auditionSpeechRate();
 });
+$("#speech-rate").addEventListener("change", commitAuditionedSpeechRate);
 $("#speaker-voices").addEventListener("change", invalidateDubbingReview);
 $("#tool-blur").addEventListener("click", () => { editor.tool = "blur"; $("#tool-blur").classList.add("active"); $("#tool-subtitle").classList.remove("active"); });
 $("#tool-subtitle").addEventListener("click", () => { editor.tool = "subtitle"; $("#tool-subtitle").classList.add("active"); $("#tool-blur").classList.remove("active"); });

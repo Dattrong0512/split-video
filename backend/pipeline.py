@@ -710,7 +710,12 @@ def render_job(job: dict, request, voices: dict) -> None:
     dimensions = job.get("video_size") or video_size(job["source"])
     ass = job["work_dir"] / ("review-subtitles.ass" if preview_only else "subtitles.ass")
     write_ass(ass, rendered_cues, request.subtitleRect, dimensions)
-    result = job["work_dir"] / ("review.mp4" if preview_only else "result.mp4")
+    if preview_only:
+        review_sequence = int(job.get("review_sequence", 0)) + 1
+        job["review_sequence"] = review_sequence
+        result = job["work_dir"] / f"review-{review_sequence:03d}.mp4"
+    else:
+        result = job["work_dir"] / "result.mp4"
     duration = limit if preview_only else float(job["duration"])
     filters = video_filter(request.blurRegions, ass, request.subtitleRect) + ";" + audio_mix_filter(duration)
     run([ffmpeg(), "-y", "-i", str(job["source"]), "-i", str(background), "-i", str(dubbing), "-filter_complex", filters,
