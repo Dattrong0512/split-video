@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -61,6 +62,23 @@ class ServerContractTest(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"]["code"], "INVALID_URL")
+
+    def test_queued_job_does_not_claim_it_is_waiting_for_gpu(self):
+        with patch.object(server.EXECUTOR, "submit"):
+            response = self.client.post("/api/jobs/analyze", headers=self.auth, json={
+                "canonicalUrl": "https://www.douyin.com/video/7674912144722875109",
+                "cookieText": "cookie",
+                "geminiApiKey": "not-a-real-key",
+                "blurMode": "auto",
+            })
+        job_id = response.json()["jobId"]
+        try:
+            job = self.client.get(f"/api/jobs/{job_id}", headers=self.auth).json()
+            self.assertEqual(job["status"], "queued")
+            self.assertNotIn("GPU", job["message"])
+            self.assertIn("phân tích", job["message"])
+        finally:
+            server.cleanup_job(job_id)
 
     def test_public_job_never_returns_credentials(self):
         public = server.public_job({

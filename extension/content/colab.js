@@ -13,7 +13,6 @@ if (location.href.includes("/github/Dattrong0512/split-video/blob/main/OmniVoice
   let lastNotebookProgressAt = 0;
   let forceRunPending = false;
   let lastControlClickAt = 0;
-  let minimumReadyAt = 0;
   let automationTimer = null;
   let cachedRoots = [document];
   let rootsExpireAt = 0;
@@ -93,10 +92,16 @@ if (location.href.includes("/github/Dattrong0512/split-video/blob/main/OmniVoice
     if (!newestHandshake || newestHandshake === lastHandshake) return;
     try {
       const payload = JSON.parse(newestHandshake);
-      if (/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/i.test(payload.url || "") && payload.token && Number(payload.createdAt || 0) >= minimumReadyAt) {
+      if (/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/i.test(payload.url || "") && payload.token) {
         lastHandshake = newestHandshake;
         document.getElementById("neko-colab-helper")?.remove();
-        chrome.runtime.sendMessage({ type: "COLAB_READY", payload }).catch(() => {});
+        chrome.runtime.sendMessage({ type: "COLAB_READY", payload }).then((response) => {
+          if (!response?.stale || lastHandshake !== newestHandshake) return;
+          lastHandshake = "";
+          forceRunPending = true;
+          sendProgress({ stage: "restart", progress: 12, message: "Kết nối cũ đã hết hạn. Đang tạo máy chủ mới…" });
+          scheduleTick(50);
+        }).catch(() => {});
       }
     } catch (_) {}
   }
@@ -194,7 +199,6 @@ if (location.href.includes("/github/Dattrong0512/split-video/blob/main/OmniVoice
       lastNotebookProgressAt = 0;
       lastControlClickAt = 0;
       forceRunPending = true;
-      minimumReadyAt = Math.floor(Date.now() / 1000) - 2;
       rootsExpireAt = 0;
     }
     scheduleTick(50);

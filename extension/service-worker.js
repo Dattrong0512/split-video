@@ -4,6 +4,20 @@ let openingColab = null;
 const pendingColabTabs = new Set();
 const activeDownloads = new Set();
 
+async function serverSessionIsAlive(session) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const response = await fetch(`${session.url}/api/health`, {
+        headers: { Authorization: `Bearer ${session.token}` },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (response.ok) return true;
+    } catch (_) {}
+    if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 600));
+  }
+  return false;
+}
+
 async function protectPrivateStorage() {
   await chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
 }
@@ -51,12 +65,17 @@ chrome.downloads.onChanged.addListener(async (delta) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const fromDubbingNotebook = sender.tab?.url?.startsWith("https://colab.research.google.com/") && sender.tab.url.includes(NOTEBOOK_PATH);
   if (message?.type === "COLAB_READY" && fromDubbingNotebook && /^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/i.test(message.payload?.url || "")) {
-    const readyProgress = { stage: "ready", progress: 100, message: "Colab T4 và máy chủ đã sẵn sàng." };
-    chrome.storage.session.set({ serverSession: message.payload, colabProgress: readyProgress }).then(() => {
+    (async () => {
+      if (!await serverSessionIsAlive(message.payload)) {
+        sendResponse({ ok: false, stale: true });
+        return;
+      }
+      const readyProgress = { stage: "ready", progress: 100, message: "Colab T4 và máy chủ đã sẵn sàng." };
+      await chrome.storage.session.set({ serverSession: message.payload, colabProgress: readyProgress });
       chrome.runtime.sendMessage({ type: "SERVER_SESSION_UPDATED", payload: message.payload }).catch(() => {});
       chrome.runtime.sendMessage({ type: "COLAB_PROGRESS_UPDATED", payload: readyProgress }).catch(() => {});
       sendResponse({ ok: true });
-    });
+    })().catch(() => sendResponse({ ok: false, stale: true }));
     return true;
   }
   if (message?.type === "COLAB_PROGRESS" && fromDubbingNotebook) {
@@ -72,9 +91,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const tabs = await chrome.tabs.query({ url: "https://colab.research.google.com/*" });
         const existing = tabs.find((tab) => (tab.url || "").includes(NOTEBOOK_PATH));
         if (existing?.id) {
-          await chrome.tabs.update(existing.id, { active: true });
+          const refreshed = await chrome.tabs.update(existing.id, { active: true, url: NOTEBOOK_URL });
           if (existing.windowId) await chrome.windows.update(existing.windowId, { focused: true });
-          await startColabAutomation(existing.id, true);
+          if (refreshed?.status === "complete") startColabAutomation(existing.id, false).catch(() => {});
+          else pendingColabTabs.add(existing.id);
           return { ok: true, tabId: existing.id, reused: true };
         }
         const tab = await chrome.tabs.create({ url: NOTEBOOK_URL, active: true });

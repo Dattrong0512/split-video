@@ -32,6 +32,7 @@ assert.equal(
 function runColabWithShadowOutput(output) {
   const messages = [];
   let listener;
+  let timer;
   const status = { textContent: output, shadowRoot: null };
   const shadow = {
     host: { matches: () => true }, textContent: output,
@@ -47,7 +48,7 @@ function runColabWithShadowOutput(output) {
   };
   const context = {
     globalThis: {}, document, location: { href: "https://colab.research.google.com/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb" },
-    setTimeout: () => 1, clearTimeout: () => {},
+    setTimeout: (callback) => { timer = callback; return 1; }, clearTimeout: () => {},
     chrome: { runtime: {
       sendMessage: (message) => { messages.push(message); return Promise.resolve(); },
       onMessage: { addListener: (value) => { listener = value; } },
@@ -55,7 +56,11 @@ function runColabWithShadowOutput(output) {
   };
   context.globalThis = context;
   vm.runInNewContext(fs.readFileSync("extension/content/colab.js", "utf8"), context);
-  return { messages, listener };
+  return {
+    messages, listener,
+    setOutput: (value) => { status.textContent = value; shadow.textContent = value; },
+    runTimer: () => { const callback = timer; timer = null; callback?.(); },
+  };
 }
 
 const createdAt = Math.floor(Date.now() / 1000);
@@ -65,12 +70,25 @@ assert.ok(colab.messages.some((message) => message.type === "COLAB_PROGRESS" && 
 assert.ok(colab.messages.some((message) => message.type === "COLAB_READY" && message.payload.token === "temporary-token"));
 assert.equal(typeof colab.listener, "function");
 
+const reinjected = runColabWithShadowOutput(`NEKO_PROGRESS {"stage":"tunnel","progress":82,"message":"old progress"}`);
+reinjected.listener({ type: "START_COLAB_AUTOMATION", force: true }, {}, () => {});
+const earlierHandshake = JSON.stringify({ url: "https://still-live.trycloudflare.com", token: "existing-token", createdAt: createdAt - 300 });
+reinjected.setOutput(`NEKO_PROGRESS {"stage":"tunnel","progress":82,"message":"old progress"}\nNEKO_SERVER_READY ${earlierHandshake}`);
+reinjected.runTimer();
+assert.ok(reinjected.messages.some((message) => message.type === "COLAB_READY" && message.payload.token === "existing-token"));
+
 async function testServiceWorkerReinjectsExistingColabTab() {
   let runtimeListener;
   let injectionCount = 0;
   let messageCount = 0;
+  let healthOk = true;
+  let refreshedUrl = "";
+  let tabUpdatedListener;
   const event = () => ({ addListener: () => {} });
   const context = {
+    fetch: async () => ({ ok: healthOk }),
+    AbortSignal: { timeout: () => ({}) },
+    setTimeout: (callback) => { callback(); return 1; },
     chrome: {
       sidePanel: { setPanelBehavior: async () => {} },
       storage: {
@@ -83,9 +101,12 @@ async function testServiceWorkerReinjectsExistingColabTab() {
         sendMessage: async () => {},
       },
       tabs: {
-        onUpdated: event(), onRemoved: event(),
+        onUpdated: { addListener: (value) => { tabUpdatedListener = value; } }, onRemoved: event(),
         query: async () => [{ id: 7, windowId: 3, url: "https://colab.research.google.com/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb" }],
-        update: async () => {},
+        update: async (_tabId, options) => {
+          refreshedUrl = options.url || "";
+          return { id: 7, windowId: 3, status: "loading", url: refreshedUrl };
+        },
         create: async () => ({ id: 8 }),
         sendMessage: async () => {
           messageCount += 1;
@@ -104,8 +125,29 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   });
   assert.equal(response.ok, true);
   assert.equal(response.reused, true);
+  assert.equal(refreshedUrl, "https://colab.research.google.com/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb");
+  assert.equal(injectionCount, 0);
+  assert.equal(messageCount, 0);
+  tabUpdatedListener(7, { status: "complete" }, { url: refreshedUrl });
+  await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(injectionCount, 1);
   assert.equal(messageCount, 2);
+
+  const notebookSender = { tab: { url: "https://colab.research.google.com/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb" } };
+  const live = await new Promise((resolve) => {
+    assert.equal(runtimeListener({
+      type: "COLAB_READY", payload: { url: "https://live.trycloudflare.com", token: "token" },
+    }, notebookSender, resolve), true);
+  });
+  assert.equal(live.ok, true);
+
+  healthOk = false;
+  const stale = await new Promise((resolve) => {
+    assert.equal(runtimeListener({
+      type: "COLAB_READY", payload: { url: "https://stale.trycloudflare.com", token: "token" },
+    }, notebookSender, resolve), true);
+  });
+  assert.equal(stale.stale, true);
 }
 
 testServiceWorkerReinjectsExistingColabTab()

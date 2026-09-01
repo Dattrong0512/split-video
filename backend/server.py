@@ -27,7 +27,7 @@ JOBS: dict[str, dict] = {}
 VOICES: dict[str, dict] = {}
 LOCK = threading.RLock()
 
-app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.3.0", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.3.1", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
@@ -94,7 +94,7 @@ def create_analysis(request: AnalyzeRequest) -> dict:
     work_dir.mkdir(parents=True)
     with LOCK:
         JOBS[job_id] = {
-            "id": job_id, "status": "queued", "progress": 1, "message": "Đang chờ GPU…",
+            "id": job_id, "status": "queued", "progress": 1, "message": "Đang bắt đầu phân tích trên Colab…",
             "canonical_url": request.canonicalUrl, "cookie_text": request.cookieText,
             "gemini_key": request.geminiApiKey, "blur_mode": request.blurMode,
             "work_dir": work_dir, "cancelled": False,
