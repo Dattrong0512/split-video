@@ -196,14 +196,24 @@ def _translation_cue_payload(cue: dict) -> dict:
         "end_seconds": round(float(cue["end"]), 3),
         "duration_seconds": round(duration, 3),
         "target_vi_characters": max(12, round(duration * 18)),
-        "on_screen_subtitle_ocr": str(cue.get("screen_text", "")).strip(),
         "whisper_transcript": cue["original"],
     }
 
 
-def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
-    client = None
-    uploaded = None
+def _translation_prompt(cues: list[dict]) -> str:
+    return (
+        "Dựa trên whisper_transcript tiếng Trung, sửa lỗi nhận dạng rồi viết lại thành bản dịch tiếng Việt chính xác, tự nhiên. "
+        "Chỉ dùng nội dung trong transcript; tuyệt đối không sáng tác, suy diễn hoặc thêm kiến thức ngoài lời nói. "
+        "original_corrected phải là transcript tiếng Trung đã sửa. Mọi id, start_seconds, end_seconds và "
+        "duration_seconds là bất biến: không bỏ, thêm, gộp, tách hoặc đổi thời gian cue. text_vi phải đủ nghĩa, "
+        "viết hoa kiểu câu bình thường và hướng tới target_vi_characters để đọc vừa thời lượng gốc; chỉ rút gọn cách diễn đạt, "
+        "không được làm mất chủ thể, hành động, con số hay sự kiện chính. Dùng speaker S1 và gender unknown nếu transcript "
+        "không có bằng chứng rõ ràng về người nói khác. Dữ liệu cue: " +
+        json.dumps([_translation_cue_payload(cue) for cue in cues], ensure_ascii=False)
+    )
+
+
+def gemini_translate(cues: list[dict], api_key: str) -> list[dict]:
     try:
         from google import genai
         from google.genai import types
@@ -214,21 +224,9 @@ def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
                 retry_options=types.HttpRetryOptions(**_gemini_retry_options()),
             ),
         )
-        uploaded = client.files.upload(file=str(audio))
-        prompt = (
-            "Dịch chính xác từng câu tiếng Trung sang tiếng Việt. on_screen_subtitle_ocr là nguồn nội dung chính "
-            "khi nó khớp với audio của cue: đó là subtitle gốc đọc bằng OCR nên có thể sai vài ký tự; hãy dùng audio đính kèm và "
-            "whisper_transcript để sửa lỗi OCR, tuyệt đối không sáng tác, diễn giải thêm hoặc đưa kiến thức ngoài video. "
-            "Nếu OCR trống thì dựa vào audio và Whisper. original_corrected phải là đúng câu tiếng Trung đã được sửa. "
-            "Giữ nguyên từng id, không bỏ, thêm, gộp hay tách cue. text_vi phải đủ nghĩa, tự nhiên, viết hoa kiểu câu "
-            "bình thường và hướng tới target_vi_characters để đọc vừa duration_seconds; chỉ rút gọn cách diễn đạt, "
-            "không được làm mất chủ thể, hành động, con số hay sự kiện chính. Gán người nói nhất quán S1, S2... và "
-            "chỉ suy đoán giới tính khi nghe đủ rõ. Dữ liệu cue: " +
-            json.dumps([_translation_cue_payload(cue) for cue in cues], ensure_ascii=False)
-        )
         response = client.models.generate_content(
             model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
-            contents=[prompt, uploaded],
+            contents=_translation_prompt(cues),
             config=types.GenerateContentConfig(
                 response_mime_type="application/json", response_json_schema=_translation_schema(), temperature=.1,
             ),
@@ -238,13 +236,7 @@ def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
         value = str(error).lower()
         if "api key" in value or "401" in value or "403" in value:
             raise PipelineError("INVALID_GEMINI_KEY", "Gemini API key không hợp lệ hoặc đã bị khóa.") from error
-        raise PipelineError("GEMINI_FAILED", f"Gemini không xử lý được audio: {error}") from error
-    finally:
-        if client is not None and uploaded is not None and getattr(uploaded, "name", None):
-            try:
-                client.files.delete(name=uploaded.name)
-            except Exception:
-                pass
+        raise PipelineError("GEMINI_FAILED", f"Gemini không xử lý được transcript: {error}") from error
     try:
         rows = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I))
         return _apply_translation_rows(cues, rows)
@@ -420,7 +412,7 @@ def _paddle_ocr():
     return _ocr_model
 
 
-def detect_blur_regions(source: Path, duration: float, cues: list[dict] | None = None) -> list[dict]:
+def detect_blur_regions(source: Path, duration: float) -> list[dict]:
     width, height = video_size(source)
     try:
         import cv2
@@ -430,22 +422,12 @@ def detect_blur_regions(source: Path, duration: float, cues: list[dict] | None =
         ocr = _paddle_ocr()
     except Exception:
         ocr = None
-    cue_list = cues or []
-    samples: list[dict] = []
-    for cue in cue_list:
-        samples.append({"time": min(duration, max(0, (float(cue["start"]) + float(cue["end"])) / 2)), "cues": [cue]})
-    for index in range(24):
-        timestamp = duration * (index + .5) / 24
-        nearby = next((sample for sample in samples if abs(sample["time"] - timestamp) <= max(.08, duration / 96)), None)
-        if nearby is None:
-            samples.append({"time": timestamp, "cues": []})
-    samples.sort(key=lambda item: item["time"])
-    capture = cv2.VideoCapture(str(source)); sample_count = len(samples)
+    capture = cv2.VideoCapture(str(source)); sample_count = 24
     text_detections: list[tuple[int, dict]] = []
     color_detections: list[tuple[int, dict]] = []
     try:
-        for index, sample in enumerate(samples):
-            capture.set(cv2.CAP_PROP_POS_MSEC, sample["time"] * 1000)
+        for index in range(sample_count):
+            capture.set(cv2.CAP_PROP_POS_MSEC, (duration * (index + .5) / sample_count) * 1000)
             ok, frame = capture.read()
             if not ok: continue
             frame_height, frame_width = frame.shape[:2]
@@ -456,8 +438,6 @@ def detect_blur_regions(source: Path, duration: float, cues: list[dict] | None =
                 except Exception:
                     try: rows = _old_ocr_rows(ocr.ocr(frame), frame_width, frame_height)
                     except Exception: rows = []
-            for cue in sample["cues"]:
-                cue["screen_text"] = _screen_subtitle_text(rows)
             boxes = [row["rect"] for row in rows]
             text_detections.extend((index, rect) for rect in boxes if rect["w"] > .015 and rect["h"] > .008)
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -482,11 +462,12 @@ def analyze_job(job: dict, _voices: dict) -> None:
     duration = media_duration(source); dimensions = video_size(source); audio, preview = extract_assets(source, job["work_dir"], duration)
     update(job, 24, "Whisper đang nhận diện lời thoại…")
     cues = transcribe(audio)
-    update(job, 34, "Đang đọc subtitle tiếng Trung gốc trên từng cảnh…")
-    detected_regions = detect_blur_regions(source, duration, cues)
-    update(job, 46, "Gemini đang đối chiếu subtitle gốc với lời thoại…")
-    cues = gemini_translate(cues, audio, job.pop("gemini_key"))
-    regions = detected_regions if job["blur_mode"] == "auto" else []
+    update(job, 36, "Gemini đang sửa lời thoại và viết lại tiếng Việt theo thời gian gốc…")
+    cues = gemini_translate(cues, job.pop("gemini_key"))
+    regions = []
+    if job["blur_mode"] == "auto":
+        update(job, 46, "Đang tự tìm subtitle gốc và watermark xanh…")
+        regions = detect_blur_regions(source, duration)
     speakers_by_id = {}
     for cue in cues: speakers_by_id.setdefault(cue["speaker"], cue["gender"])
     speakers = [{"id": key, "gender": value} for key, value in sorted(speakers_by_id.items())]
@@ -598,17 +579,33 @@ def create_dubbing(job: dict, request, voices: dict) -> Path:
     return output
 
 
+def original_bed_filter() -> str:
+    return (
+        "[0:a]volume=1.0[background]"
+        ";[1:a]volume=0.12[original_voice]"
+        ";[background][original_voice]amix=inputs=2:duration=longest:normalize=0,"
+        "alimiter=limit=.95[bed]"
+    )
+
+
 def separate_background(job: dict) -> Path:
     output = job["work_dir"] / "separated"
-    update(job, 79, "Đang tách lời gốc để giữ nhạc và hiệu ứng…")
+    update(job, 79, "Đang giữ nhạc, hiệu ứng và một ít giọng nói gốc…")
     result = subprocess.run([sys.executable, "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs", "-o", str(output), str(job["source"])], capture_output=True, text=True)
     candidates = list(output.glob("**/no_vocals.wav"))
-    if result.returncode or not candidates:
+    background = candidates[0] if candidates else None
+    vocals = background.with_name("vocals.wav") if background is not None else None
+    if result.returncode or background is None or vocals is None or not vocals.exists():
         fallback = job["work_dir"] / "background.wav"
         run([ffmpeg(), "-y", "-i", str(job["source"]), "-vn", "-af", "volume=0.12", str(fallback)], "AUDIO_SEPARATION_FAILED")
         job["warning"] = "Demucs không tách được vocal; đã dùng âm thanh gốc ở mức 12%."
         return fallback
-    return candidates[0]
+    bed = job["work_dir"] / "background-with-original-voice.wav"
+    run([
+        ffmpeg(), "-y", "-i", str(background), "-i", str(vocals),
+        "-filter_complex", original_bed_filter(), "-map", "[bed]", str(bed),
+    ], "AUDIO_SEPARATION_FAILED")
+    return bed
 
 
 def ass_time(value: float) -> str:

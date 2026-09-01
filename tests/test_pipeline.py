@@ -6,9 +6,10 @@ from unittest.mock import MagicMock, patch
 
 from backend.pipeline import (
     DEFAULT_GEMINI_MODEL, PipelineError, _apply_translation_rows, _atempo, _gemini_retry_options,
-    _old_ocr_rows, _screen_subtitle_text, _translation_cue_payload, _translation_schema,
+    _old_ocr_rows, _screen_subtitle_text, _translation_cue_payload, _translation_prompt, _translation_schema,
     _v3_ocr_boxes, _v3_ocr_rows, audio_mix_filter, cluster_rectangles, encoding_options,
-    ensure_portrait_subtitle_blur, plan_dubbing_timeline, transcribe, video_filter, write_ass,
+    ensure_portrait_subtitle_blur, original_bed_filter, plan_dubbing_timeline, transcribe,
+    video_filter, write_ass,
 )
 
 
@@ -121,13 +122,29 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertEqual(translated[0]["text_vi"], "Xin chào.")
         self.assertEqual(translated[0]["confidence"], .96)
 
-    def test_translation_payload_grounds_gemini_in_on_screen_subtitle(self):
+    def test_translation_payload_uses_speech_and_preserves_timestamps(self):
         payload = _translation_cue_payload({
-            "id": 2, "start": 1, "end": 2, "original": "错误听写", "screen_text": "准确原字幕",
+            "id": 2, "start": 1, "end": 2, "original": "需要修改的听写", "screen_text": "不应发送给Gemini",
         })
-        self.assertEqual(payload["on_screen_subtitle_ocr"], "准确原字幕")
-        self.assertEqual(payload["whisper_transcript"], "错误听写")
+        self.assertNotIn("on_screen_subtitle_ocr", payload)
+        self.assertEqual(payload["whisper_transcript"], "需要修改的听写")
+        self.assertEqual(payload["start_seconds"], 1)
+        self.assertEqual(payload["end_seconds"], 2)
         self.assertEqual(payload["target_vi_characters"], 18)
+
+    def test_translation_prompt_uses_only_whisper_not_audio_or_ocr(self):
+        prompt = _translation_prompt([{
+            "id": 2, "start": 1, "end": 2, "original": "只使用语音识别文字", "screen_text": "不要使用OCR",
+        }])
+        self.assertIn("只使用语音识别文字", prompt)
+        self.assertNotIn("不要使用OCR", prompt)
+        self.assertNotIn("audio đính kèm", prompt)
+        self.assertIn("start_seconds, end_seconds", prompt)
+
+    def test_original_voice_is_kept_quietly_below_dub(self):
+        filters = original_bed_filter()
+        self.assertIn("[1:a]volume=0.12[original_voice]", filters)
+        self.assertIn("amix=inputs=2:duration=longest", filters)
 
     def test_translation_schema_stays_simple_for_flash_lite(self):
         schema = _translation_schema()
