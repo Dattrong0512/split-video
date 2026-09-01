@@ -19,8 +19,9 @@ Chrome extension lấy video Douyin đang hiển thị, tạo phụ đề và l�
 
 1. Mở video trên `douyin.com`; có thể là trang feed/discover hoặc URL `/video/<id>`.
 2. Bấm biểu tượng extension để mở side panel. Extension tự lấy URL chuẩn của video đang phát.
-3. Chọn preset Hoài My/Nam Minh hoặc thêm voice clone. Giữ chế độ **Tự động** và bấm **Tải & lồng tiếng** đúng một lần.
-4. Extension tự mở hoặc dùng lại đúng tab `OmniVoice_API.ipynb`, kết nối GPU T4, chạy notebook, xử lý video và yêu cầu Chrome tải MP4. Giữ tab Colab mở cho tới khi tải bắt đầu.
+3. Chọn preset Hoài My/Nam Minh hoặc thêm voice clone. Giữ chế độ **Tự động** và bấm phân tích.
+4. Extension tự tạo bản xem trước 30 giây. Hãy nghe, kéo tốc độ giọng trong khoảng 0,80–1,40× nếu cần rồi tạo lại preview. Khi đã khớp giọng gốc, bấm xuất toàn bộ video.
+5. Extension tự mở hoặc dùng lại đúng tab `OmniVoice_API.ipynb`, kết nối GPU T4, chạy notebook, xử lý video và yêu cầu Chrome tải MP4. Giữ tab Colab mở cho tới khi tải bắt đầu.
 
 Pipeline dùng Whisper nhận dạng lời nói rồi để Gemini sửa transcript và viết lại tiếng Việt theo nguyên timestamp từng cue; OCR chỉ phục vụ tìm vùng blur. Nhịp TTS được fit về thời lượng câu gốc trong khoảng tự nhiên 0,90–1,15×. Khi xuất video, một lớp giọng gốc nhỏ được giữ dưới giọng Việt để video vẫn có cảm giác người trong cảnh đang nói.
 

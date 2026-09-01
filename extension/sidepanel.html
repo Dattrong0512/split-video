@@ -22,9 +22,9 @@
       <div class="row"><select id="default-voice"></select><button id="delete-clone" class="secondary" title="Xóa voice clone đang chọn">Xóa</button></div><input id="clone-file" type="file" accept="audio/*,video/*" hidden><div id="speaker-voices" hidden></div>
     </section>
     <section class="card mode-card">
-      <div class="section-title"><span>Xử lý khung</span><span id="frame-mode-label">Tự động một lần bấm</span></div>
+      <div class="section-title"><span>Xử lý khung</span><span id="frame-mode-label">Tự động + duyệt 30 giây</span></div>
       <div class="segmented"><button data-blur-mode="auto" class="active">Tự động</button><button data-blur-mode="manual">Chỉnh thủ công</button></div>
-      <small>Tự động sẽ phân tích, lồng tiếng và tải video. Thủ công sẽ dừng một lần để bạn sửa nhiều vùng blur và một khung subtitle.</small>
+      <small>Tự động vẫn dừng ở bản xem trước 30 giây để bạn duyệt tốc độ giọng. Thủ công còn cho phép sửa nhiều vùng blur và một khung subtitle.</small>
     </section>
     <section id="editor-card" class="card" hidden>
       <div class="section-title"><span>Một khung chỉnh sửa</span><span>Blur + subtitle</span></div>
@@ -33,7 +33,15 @@
       <div class="editor-tools"><button id="tool-blur" class="active">Vùng blur</button><button id="tool-subtitle">Khung subtitle</button><button id="delete-region" class="danger">Xóa vùng chọn</button></div>
       <small>Phát hoặc kéo timeline tới frame có chữ, rồi vẽ khung. Khung subtitle xanh có nền mờ nhẹ; có thể tạo nhiều vùng blur màu hồng.</small>
     </section>
-    <section class="card status-card"><div class="progress"><i id="progress-bar"></i></div><p id="status">Sẵn sàng.</p><button id="primary" class="primary">Tải & lồng tiếng</button><button id="cancel" class="secondary full" hidden>Hủy</button></section>
+    <section id="speed-card" class="card" hidden>
+      <div class="section-title"><span>Nghe thử 30 giây</span><output id="speech-rate-value">1.00×</output></div>
+      <label for="speech-rate">Tốc độ giọng Việt</label>
+      <input id="speech-rate" class="speed-range" type="range" min="0.8" max="1.4" step="0.05" value="1">
+      <div class="range-labels"><span>Chậm 0.80×</span><span>Nhanh 1.40×</span></div>
+      <video id="review-video" controls playsinline preload="metadata" hidden></video>
+      <small id="speed-help">Tạo bản xem trước, nghe cùng giọng gốc rồi kéo thanh tốc độ. Mỗi lần đổi tốc độ cần tạo lại preview trước khi xuất toàn bộ.</small>
+    </section>
+    <section class="card status-card"><div class="progress"><i id="progress-bar"></i></div><p id="status">Sẵn sàng.</p><button id="primary" class="primary">Phân tích video</button><button id="cancel" class="secondary full" hidden>Hủy</button></section>
   </main>
   <dialog id="clone-dialog"><form method="dialog"><h2>Thêm giọng clone</h2><label>Tên giọng</label><input id="clone-name" maxlength="40" placeholder="Ví dụ: Giọng của tôi"><p>Chọn clip rõ tiếng, chỉ một người nói, dài 3–10 giây. Chỉ dùng giọng bạn có quyền sử dụng.</p><div class="dialog-actions"><button value="cancel" class="secondary">Hủy</button><button id="choose-clone" value="default">Chọn clip</button></div></form></dialog>
   <script type="module" src="sidepanel.js"></script>

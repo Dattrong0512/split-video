@@ -494,7 +494,10 @@ def _atempo(speed: float) -> str:
     return ",".join(parts)
 
 
-def plan_dubbing_timeline(cues: list[dict], generated_durations: list[float], video_duration: float, gap: float = .04) -> list[dict]:
+def plan_dubbing_timeline(
+    cues: list[dict], generated_durations: list[float], video_duration: float,
+    gap: float = .04, speech_rate: float = 1.0,
+) -> list[dict]:
     if len(cues) != len(generated_durations):
         raise ValueError("Mỗi cue phải có đúng một audio TTS")
     timeline = []
@@ -504,7 +507,8 @@ def plan_dubbing_timeline(cues: list[dict], generated_durations: list[float], vi
         original_duration = max(.25, float(cue["end"]) - float(cue["start"]))
         generated = max(.05, float(generated))
         ideal_for_original = generated / original_duration
-        speed = min(1.15, max(.90, ideal_for_original))
+        automatic_speed = min(1.15, max(.90, ideal_for_original))
+        speed = min(1.5, max(.72, automatic_speed * speech_rate))
         end = start + generated / speed
         timeline.append({"start": start, "end": end, "speed": speed})
         cursor = end + gap
@@ -546,37 +550,47 @@ def synthesize_cue(text: str, voice: str, raw: Path, voices: dict) -> None:
     sf.write(str(raw), audio, model.sampling_rate)
 
 
-def create_dubbing(job: dict, request, voices: dict) -> Path:
+def create_dubbing(job: dict, request, voices: dict, duration_limit: float | None = None) -> tuple[Path, list[dict]]:
     from pydub import AudioSegment
     AudioSegment.converter = ffmpeg()
     directory: Path = job["work_dir"] / "tts"; directory.mkdir(exist_ok=True)
-    total = len(job["cues"])
+    cues = [dict(cue) for cue in job["cues"] if duration_limit is None or float(cue["start"]) < duration_limit]
+    total = len(cues)
+    cache = job.setdefault("tts_cache", {})
     generated_files = []
     generated_durations = []
-    for index, cue in enumerate(job["cues"], 1):
-        update(job, 62 + index / total * 12, f"Đang tạo giọng Việt {index}/{total} ({cue['speaker']})…")
+    for index, cue in enumerate(cues, 1):
         voice = request.voiceMap.get(cue["speaker"]) or request.voiceMap.get("*") or "edge:vi-VN-HoaiMyNeural"
-        raw = directory / f"{index:04d}.wav"
-        synthesize_cue(cue["text_vi"], voice, raw, voices)
+        cache_key = str(cue["id"])
+        cached = cache.get(cache_key, {})
+        raw = directory / f"raw-{int(cue['id']):04d}.wav"
+        if cached.get("voice") != voice or cached.get("text") != cue["text_vi"] or not raw.exists():
+            update(job, 62 + index / max(1, total) * 12, f"Đang tạo giọng Việt {index}/{total} ({cue['speaker']})…")
+            synthesize_cue(cue["text_vi"], voice, raw, voices)
+            cache[cache_key] = {"voice": voice, "text": cue["text_vi"], "duration": media_duration(raw)}
         generated_files.append(raw)
-        generated_durations.append(media_duration(raw))
-    timeline = plan_dubbing_timeline(job["cues"], generated_durations, float(job["duration"]))
+        generated_durations.append(float(cache[cache_key]["duration"]))
+    output_duration = min(float(job["duration"]), duration_limit) if duration_limit is not None else float(job["duration"])
+    timeline = plan_dubbing_timeline(cues, generated_durations, output_duration, speech_rate=float(request.speechRate))
     rendered_segments = []
-    for index, (cue, raw, timing) in enumerate(zip(job["cues"], generated_files, timeline), 1):
+    for index, (cue, raw, timing) in enumerate(zip(cues, generated_files, timeline), 1):
         update(job, 74 + index / total * 4, f"Đang căn thời gian giọng Việt {index}/{total}…")
-        fitted = directory / f"{index:04d}-fit.wav"
+        fitted = directory / f"fit-{int(cue['id']):04d}.wav"
         run([ffmpeg(), "-y", "-i", str(raw), "-af", _atempo(timing["speed"]), "-ar", "24000", "-ac", "1", str(fitted)], "VOICE_FAILED")
-        segment = AudioSegment.from_file(fitted).set_frame_rate(24000).set_channels(1)
+        with fitted.open("rb") as fitted_stream:
+            segment = AudioSegment.from_file(fitted_stream, format="wav").set_frame_rate(24000).set_channels(1)
         cue["start"] = timing["start"]
         cue["end"] = timing["start"] + len(segment) / 1000
         cue["speech_speed"] = timing["speed"]
         rendered_segments.append((cue["start"], segment))
-    final_duration = max(float(job["duration"]), max(cue["end"] for cue in job["cues"]))
+    final_duration = max(output_duration, max((cue["end"] for cue in cues), default=0))
     final = AudioSegment.silent(duration=math.ceil(final_duration * 1000) + 250, frame_rate=24000).set_channels(1)
     for start, segment in rendered_segments:
         final = final.overlay(segment, position=max(0, round(start * 1000)))
-    output = job["work_dir"] / "dubbing.wav"; final.export(output, format="wav")
-    return output
+    output = job["work_dir"] / "dubbing.wav"
+    with output.open("wb") as output_stream:
+        final.export(output_stream, format="wav")
+    return output, cues
 
 
 def original_bed_filter() -> str:
@@ -589,6 +603,9 @@ def original_bed_filter() -> str:
 
 
 def separate_background(job: dict) -> Path:
+    cached = job.get("background")
+    if cached and Path(cached).exists():
+        return Path(cached)
     output = job["work_dir"] / "separated"
     update(job, 79, "Đang giữ nhạc, hiệu ứng và một ít giọng nói gốc…")
     result = subprocess.run([sys.executable, "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs", "-o", str(output), str(job["source"])], capture_output=True, text=True)
@@ -599,12 +616,14 @@ def separate_background(job: dict) -> Path:
         fallback = job["work_dir"] / "background.wav"
         run([ffmpeg(), "-y", "-i", str(job["source"]), "-vn", "-af", "volume=0.12", str(fallback)], "AUDIO_SEPARATION_FAILED")
         job["warning"] = "Demucs không tách được vocal; đã dùng âm thanh gốc ở mức 12%."
+        job["background"] = fallback
         return fallback
     bed = job["work_dir"] / "background-with-original-voice.wav"
     run([
         ffmpeg(), "-y", "-i", str(background), "-i", str(vocals),
         "-filter_complex", original_bed_filter(), "-map", "[bed]", str(bed),
     ], "AUDIO_SEPARATION_FAILED")
+    job["background"] = bed
     return bed
 
 
@@ -681,16 +700,25 @@ def encoding_options(dimensions: tuple[int, int], duration: float) -> list[str]:
 
 
 def render_job(job: dict, request, voices: dict) -> None:
-    update(job, 58, "Đang chuẩn bị lồng tiếng…", status="rendering")
-    dubbing = create_dubbing(job, request, voices)
+    preview_only = bool(request.previewOnly)
+    limit = min(30.0, float(job["duration"])) if preview_only else None
+    update(job, 58, "Đang chuẩn bị bản nghe thử 30 giây…" if preview_only else "Đang chuẩn bị lồng tiếng toàn bộ…",
+           status="rendering_preview" if preview_only else "rendering")
+    dubbing, rendered_cues = create_dubbing(job, request, voices, limit)
     background = separate_background(job)
-    update(job, 91, "Đang blur, chèn phụ đề và xuất MP4…")
+    update(job, 91, "Đang xuất bản xem trước 30 giây…" if preview_only else "Đang blur, chèn phụ đề và xuất MP4…")
     dimensions = job.get("video_size") or video_size(job["source"])
-    ass = job["work_dir"] / "subtitles.ass"; write_ass(ass, job["cues"], request.subtitleRect, dimensions)
-    result = job["work_dir"] / "result.mp4"
-    duration = float(job["duration"])
+    ass = job["work_dir"] / ("review-subtitles.ass" if preview_only else "subtitles.ass")
+    write_ass(ass, rendered_cues, request.subtitleRect, dimensions)
+    result = job["work_dir"] / ("review.mp4" if preview_only else "result.mp4")
+    duration = limit if preview_only else float(job["duration"])
     filters = video_filter(request.blurRegions, ass, request.subtitleRect) + ";" + audio_mix_filter(duration)
     run([ffmpeg(), "-y", "-i", str(job["source"]), "-i", str(background), "-i", str(dubbing), "-filter_complex", filters,
          "-map", "[vout]", "-map", "[aout]", *encoding_options(dimensions, duration), str(result)], "RENDER_FAILED")
-    job["result"] = result
-    update(job, 100, "Hoàn tất. Đang chuẩn bị tải xuống…", status="complete")
+    if preview_only:
+        job["review_result"] = result
+        job["review_rate"] = float(request.speechRate)
+        update(job, 100, "Bản xem trước 30 giây đã sẵn sàng.", status="preview_ready")
+    else:
+        job["result"] = result
+        update(job, 100, "Hoàn tất. Đang chuẩn bị tải xuống…", status="complete")

@@ -8,6 +8,7 @@ const editor = new CanvasEditor($("#preview-canvas"));
 const state = {
   canonicalUrl: "", server: null, jobId: null, stage: "idle", blurMode: "auto",
   clones: [], voices: [], analysis: null, pending: null, pollTimer: null, recoveryCount: 0, downloadId: null,
+  speechRate: 1, previewRate: null, uploadedClones: {},
 };
 
 function setStatus(message, progress = null) {
@@ -18,6 +19,7 @@ function setStatus(message, progress = null) {
 function setBusy(busy) {
   $("#primary").disabled = busy;
   $("#cancel").hidden = !busy || !state.jobId;
+  $("#speech-rate").disabled = busy;
   document.querySelectorAll("[data-blur-mode]").forEach((button) => { button.disabled = busy; });
 }
 
@@ -40,6 +42,40 @@ async function setupVideoPreview() {
   $("#preview-seek").max = String(video.duration || 0);
   $("#preview-controls").hidden = false;
   updatePreviewControls();
+}
+
+function showSpeedCard() {
+  $("#speed-card").hidden = false;
+  $("#speech-rate").value = String(state.speechRate);
+  $("#speech-rate-value").textContent = `${state.speechRate.toFixed(2)}×`;
+}
+
+async function showDubbingReview() {
+  const review = await serverFetch(`/api/jobs/${state.jobId}/review-token`, { method: "POST" });
+  const video = $("#review-video");
+  video.src = review.url;
+  video.hidden = false;
+  video.load();
+  state.previewRate = Number(review.speechRate);
+  state.speechRate = state.previewRate;
+  state.stage = "preview_ready";
+  showSpeedCard();
+  setBusy(false);
+  setStatus(`Đã tạo preview ${review.seconds.toFixed(0)} giây ở tốc độ ${state.previewRate.toFixed(2)}×. Hãy nghe thử.`, 100);
+  $("#primary").textContent = "Dùng tốc độ này & tải toàn bộ";
+  await persistJob();
+  video.play().catch(() => {});
+}
+
+function invalidateDubbingReview() {
+  if (!state.jobId || !["ready", "preview_ready"].includes(state.stage)) return;
+  state.previewRate = null;
+  state.stage = "ready";
+  $("#review-video").pause();
+  $("#review-video").hidden = true;
+  $("#primary").textContent = "Tạo lại preview 30 giây";
+  setStatus(`Tốc độ ${state.speechRate.toFixed(2)}× chưa được preview. Hãy tạo lại 30 giây để nghe thử.`, 55);
+  persistJob().catch(() => {});
 }
 
 function errorCode(error) {
@@ -151,7 +187,7 @@ async function persistJob() {
   if (!state.jobId) return chrome.storage.session.remove("activeJob");
   return chrome.storage.session.set({ activeJob: {
     jobId: state.jobId, canonicalUrl: state.canonicalUrl, stage: state.stage,
-    blurMode: state.blurMode, recoveryCount: state.recoveryCount, updatedAt: Date.now(),
+    blurMode: state.blurMode, recoveryCount: state.recoveryCount, speechRate: state.speechRate, updatedAt: Date.now(),
   } });
 }
 
@@ -208,6 +244,10 @@ async function analyze() {
   }
   const cookie = cookieSummary(saved.douyinCookies);
   if (!cookie.valid) { setBusy(false); setStatus(cookie.label); return; }
+  state.previewRate = null;
+  $("#review-video").pause();
+  $("#review-video").hidden = true;
+  $("#speed-card").hidden = true;
   setBusy(true);
   try {
     if (!await ensureServer("analyze")) return;
@@ -249,10 +289,12 @@ function showSpeakers(speakers) {
 async function applyAnalysis(analysis) {
   state.analysis = analysis;
   state.stage = "ready";
+  state.previewRate = null;
   await persistJob();
   if (state.blurMode === "auto") {
-    setStatus("Đã phân tích. Đang tự lồng tiếng và xuất video…", 56);
-    return render();
+    showSpeedCard();
+    setStatus("Đã phân tích. Đang tự tạo preview 30 giây để kiểm tra tốc độ giọng…", 56);
+    return render(true);
   }
   if (!isManualEditorPage) {
     await openManualEditor();
@@ -268,9 +310,10 @@ async function applyAnalysis(analysis) {
   try { await setupVideoPreview(); }
   catch (_) { previewReady = false; $("#preview-controls").hidden = true; }
   showSpeakers(analysis.speakers);
+  showSpeedCard();
   setBusy(false);
-  setStatus(previewReady ? "Đã phân tích. Phát/tua video, chỉnh khung rồi bấm tạo video." : "Đã phân tích nhưng không tải được video preview; vẫn có thể chỉnh trên ảnh tĩnh.", 55);
-  $("#primary").textContent = "Tạo lồng tiếng & tải xuống";
+  setStatus(previewReady ? "Đã phân tích. Chỉnh khung rồi tạo preview 30 giây để nghe tốc độ." : "Đã phân tích. Hãy chỉnh trên ảnh tĩnh rồi tạo preview 30 giây.", 55);
+  $("#primary").textContent = "Tạo preview 30 giây";
 }
 
 async function recoverDisconnectedWorkflow(error) {
@@ -295,8 +338,10 @@ async function pollJob() {
   clearTimeout(state.pollTimer);
   try {
     const job = await serverFetch(`/api/jobs/${state.jobId}`);
+    if (job.analysis) state.analysis = job.analysis;
     setStatus(job.message || "Đang xử lý…", job.progress || 0);
     if (job.status === "analysis_ready") return applyAnalysis(job.analysis);
+    if (job.status === "preview_ready") return showDubbingReview();
     if (job.status === "complete") return downloadResult();
     if (job.status === "failed" || job.status === "cancelled") throw job.error || { message: job.message };
     state.pollTimer = setTimeout(pollJob, 1500);
@@ -321,10 +366,15 @@ async function uploadClone(localId) {
   return response.voiceId;
 }
 
-async function render() {
+async function render(previewOnly) {
+  if (!previewOnly && Math.abs((state.previewRate ?? -1) - state.speechRate) > .001) {
+    invalidateDubbingReview();
+    return;
+  }
   $("#preview-video").pause();
+  $("#review-video").pause();
   setBusy(true);
-  setStatus("Đang chuẩn bị giọng đã chọn…", 58);
+  setStatus(previewOnly ? "Đang tạo bản nghe thử 30 giây…" : "Đang xuất toàn bộ video với tốc độ đã chọn…", 58);
   try {
     if (!state.server) throw { code: "TUNNEL_DISCONNECTED" };
     const selections = {};
@@ -336,19 +386,23 @@ async function render() {
       selections["*"] = $("#default-voice").value;
     }
     const cloneIds = [...new Set(Object.values(selections).filter((value) => value.startsWith("clone:")).map((value) => value.slice(6)))];
-    const uploaded = {};
-    for (const id of cloneIds) uploaded[id] = await uploadClone(id);
+    for (const id of cloneIds) {
+      if (!state.uploadedClones[id]) state.uploadedClones[id] = await uploadClone(id);
+    }
     for (const [speaker, voice] of Object.entries(selections)) {
-      if (voice.startsWith("clone:")) selections[speaker] = `clone:${uploaded[voice.slice(6)]}`;
+      if (voice.startsWith("clone:")) selections[speaker] = `clone:${state.uploadedClones[voice.slice(6)]}`;
     }
     const blurRegions = state.blurMode === "manual" ? editor.blurRegions : (state.analysis?.blurRegions || []);
     const subtitleRect = state.blurMode === "manual" ? editor.subtitleRect : (state.analysis?.subtitleRect || { x: .08, y: .78, w: .84, h: .16 });
     await serverFetch(`/api/jobs/${state.jobId}/render`, {
       method: "POST",
-      body: JSON.stringify({ voiceMap: selections, blurRegions, subtitleRect }),
+      body: JSON.stringify({
+        voiceMap: selections, blurRegions, subtitleRect,
+        speechRate: state.speechRate, previewOnly,
+      }),
       signal: AbortSignal.timeout(120000),
     });
-    state.stage = "rendering";
+    state.stage = previewOnly ? "rendering_preview" : "rendering";
     await persistJob();
     pollJob();
   } catch (error) {
@@ -407,9 +461,12 @@ async function initialize() {
     state.jobId = session.activeJob?.jobId || null;
     state.stage = session.activeJob?.stage || "idle";
     state.recoveryCount = session.activeJob?.recoveryCount || 0;
+    state.speechRate = Number(session.activeJob?.speechRate || 1);
     state.pending = session.pendingAction?.action || null;
     document.querySelectorAll("[data-blur-mode]").forEach((button) => button.classList.toggle("active", button.dataset.blurMode === state.blurMode));
   }
+  $("#speech-rate").value = String(state.speechRate);
+  $("#speech-rate-value").textContent = `${state.speechRate.toFixed(2)}×`;
   if (isManualEditorPage) {
     const currentTab = await chrome.tabs.getCurrent();
     if (currentTab?.id) await chrome.storage.session.set({ manualEditorTab: { tabId: currentTab.id, jobId: state.jobId } });
@@ -451,12 +508,16 @@ $("#cookie-file").addEventListener("change", async (event) => {
 $("#clear-cookie").addEventListener("click", async () => { await chrome.storage.local.remove("douyinCookies"); $("#cookie-status").textContent = "Chưa có cookie."; });
 $("#toggle-settings").addEventListener("click", () => { const body = $("#settings-body"); body.hidden = !body.hidden; $("#toggle-settings").textContent = body.hidden ? "Hiện" : "Ẩn"; });
 $("#refresh-video").addEventListener("click", () => findCurrentVideo());
-$("#default-voice").addEventListener("change", () => chrome.storage.local.set({ preferredVoice: $("#default-voice").value }));
+$("#default-voice").addEventListener("change", () => {
+  chrome.storage.local.set({ preferredVoice: $("#default-voice").value });
+  invalidateDubbingReview();
+});
 $("#primary").addEventListener("click", async () => {
   if (state.stage === "ready") {
     if (state.blurMode === "manual" && !isManualEditorPage) return openManualEditor();
-    return render();
+    return render(true);
   }
+  if (state.stage === "preview_ready") return render(false);
   if (state.stage === "complete") {
     state.stage = "idle";
     state.recoveryCount = 0;
@@ -468,15 +529,22 @@ $("#cancel").addEventListener("click", async () => {
   if (state.jobId) await serverFetch(`/api/jobs/${state.jobId}/cancel`, { method: "POST" }).catch(() => {});
   clearTimeout(state.pollTimer);
   state.jobId = null; state.stage = "idle"; state.analysis = null;
+  state.previewRate = null;
   await chrome.storage.session.remove(["activeJob", "pendingAction"]);
   setBusy(false); setStatus("Đã hủy.", 0);
 });
 document.querySelectorAll("[data-blur-mode]").forEach((button) => button.addEventListener("click", () => {
   state.blurMode = button.dataset.blurMode;
   document.querySelectorAll("[data-blur-mode]").forEach((item) => item.classList.toggle("active", item === button));
-  $("#frame-mode-label").textContent = state.blurMode === "auto" ? "Tự động một lần bấm" : "Dừng để chỉnh khung";
-  $("#primary").textContent = state.blurMode === "auto" ? "Tải & lồng tiếng" : "Phân tích & chỉnh khung";
+  $("#frame-mode-label").textContent = state.blurMode === "auto" ? "Tự động + duyệt 30 giây" : "Dừng để chỉnh khung";
+  $("#primary").textContent = state.blurMode === "auto" ? "Phân tích video" : "Phân tích & chỉnh khung";
 }));
+$("#speech-rate").addEventListener("input", (event) => {
+  state.speechRate = Number(event.target.value);
+  $("#speech-rate-value").textContent = `${state.speechRate.toFixed(2)}×`;
+  invalidateDubbingReview();
+});
+$("#speaker-voices").addEventListener("change", invalidateDubbingReview);
 $("#tool-blur").addEventListener("click", () => { editor.tool = "blur"; $("#tool-blur").classList.add("active"); $("#tool-subtitle").classList.remove("active"); });
 $("#tool-subtitle").addEventListener("click", () => { editor.tool = "subtitle"; $("#tool-subtitle").classList.add("active"); $("#tool-blur").classList.remove("active"); });
 $("#delete-region").addEventListener("click", () => editor.deleteSelected());

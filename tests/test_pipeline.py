@@ -1,4 +1,6 @@
 import unittest
+import shutil
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -7,9 +9,9 @@ from unittest.mock import MagicMock, patch
 from backend.pipeline import (
     DEFAULT_GEMINI_MODEL, PipelineError, _apply_translation_rows, _atempo, _gemini_retry_options,
     _old_ocr_rows, _screen_subtitle_text, _translation_cue_payload, _translation_prompt, _translation_schema,
-    _v3_ocr_boxes, _v3_ocr_rows, audio_mix_filter, cluster_rectangles, encoding_options,
+    _v3_ocr_boxes, _v3_ocr_rows, audio_mix_filter, cluster_rectangles, encoding_options, media_duration,
     ensure_portrait_subtitle_blur, original_bed_filter, plan_dubbing_timeline, transcribe,
-    video_filter, write_ass,
+    render_job, video_filter, write_ass,
 )
 
 
@@ -179,6 +181,14 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(timeline[0]["speed"], 1.1)
         self.assertAlmostEqual(timeline[0]["end"] - timeline[0]["start"], 2.0)
 
+    def test_global_speech_rate_adjusts_fitted_voice_after_automatic_timing(self):
+        cue = [{"start": 0, "end": 2}]
+        normal = plan_dubbing_timeline(cue, [2.2], 3, speech_rate=1.0)[0]
+        faster = plan_dubbing_timeline(cue, [2.2], 3, speech_rate=1.2)[0]
+        self.assertAlmostEqual(normal["speed"], 1.1)
+        self.assertAlmostEqual(faster["speed"], 1.32)
+        self.assertLess(faster["end"], normal["end"])
+
     def test_overflowing_cues_compact_into_pauses_before_video_end(self):
         cues = [{"start": 1, "end": 2}, {"start": 4, "end": 4.5}]
         timeline = plan_dubbing_timeline(cues, [2, 2], 5)
@@ -214,6 +224,50 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertEqual(options[options.index("-t") + 1], "74.100")
         self.assertEqual(options[options.index("-maxrate") + 1], "3000k")
         self.assertEqual(options[options.index("-b:a") + 1], "128k")
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required for render integration")
+    def test_preview_then_full_render_reuses_synthesized_voice(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, background = root / "source.mp4", root / "background.wav"
+            subprocess.run([
+                shutil.which("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=blue:s=320x568:d=2",
+                "-f", "lavfi", "-i", "sine=frequency=220:duration=2",
+                "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(source),
+            ], check=True)
+            subprocess.run([
+                shutil.which("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=330:duration=2", str(background),
+            ], check=True)
+
+            def fake_synthesize(_text, _voice, raw, _voices):
+                subprocess.run([
+                    shutil.which("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "sine=frequency=660:duration=1", "-ar", "24000", "-ac", "1", str(raw),
+                ], check=True)
+
+            job = {
+                "id": "preview", "work_dir": root, "source": source, "duration": 2.0, "video_size": (320, 568),
+                "cues": [{"id": 0, "start": 0, "end": 1, "text_vi": "Xin chào.", "speaker": "S1"}],
+                "cancelled": False,
+            }
+            request = SimpleNamespace(
+                voiceMap={"*": "edge:vi-VN-HoaiMyNeural"}, speechRate=1.1, previewOnly=True,
+                blurRegions=[], subtitleRect=SimpleNamespace(x=.08, y=.72, w=.84, h=.16),
+            )
+            with patch("backend.pipeline.synthesize_cue", side_effect=fake_synthesize) as synthesize, \
+                    patch("backend.pipeline.separate_background", return_value=background):
+                render_job(job, request, {})
+                self.assertEqual(job["status"], "preview_ready")
+                self.assertTrue(job["review_result"].exists())
+                self.assertNotIn("result", job)
+                self.assertAlmostEqual(media_duration(job["review_result"]), 2.0, places=1)
+                request.previewOnly = False
+                render_job(job, request, {})
+            self.assertEqual(job["status"], "complete")
+            self.assertTrue(job["result"].exists())
+            self.assertEqual(synthesize.call_count, 1)
 
 
 if __name__ == "__main__":

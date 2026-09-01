@@ -52,6 +52,11 @@ class ServerContractTest(unittest.TestCase):
                 blurRegions=[{"x": 0, "y": 0, "w": .1, "h": .1}] * 21,
                 subtitleRect={"x": .1, "y": .7, "w": .8, "h": .2},
             )
+        with self.assertRaises(ValidationError):
+            RenderRequest(
+                voiceMap={"*": "edge:vi-VN-HoaiMyNeural"},
+                subtitleRect={"x": .1, "y": .7, "w": .8, "h": .2}, speechRate=1.5,
+            )
 
     def test_analysis_rejects_non_canonical_url(self):
         response = self.client.post("/api/jobs/analyze", headers=self.auth, json={
@@ -104,6 +109,47 @@ class ServerContractTest(unittest.TestCase):
                 self.assertEqual(preview.status_code, 206)
                 self.assertEqual(preview.content, b"2345")
                 self.assertEqual(preview.headers.get("accept-ranges"), "bytes")
+            finally:
+                server.JOBS.pop(job_id, None)
+
+    def test_dub_review_token_serves_30_second_preview(self):
+        job_id = "dub-review-test"
+        with TemporaryDirectory() as directory:
+            result = Path(directory) / "review.mp4"
+            result.write_bytes(b"review-video")
+            server.JOBS[job_id] = {
+                "id": job_id, "status": "preview_ready", "review_result": result,
+                "review_rate": 1.15, "duration": 70,
+            }
+            try:
+                created = self.client.post(f"/api/jobs/{job_id}/review-token", headers=self.auth)
+                self.assertEqual(created.status_code, 200)
+                self.assertEqual(created.json()["seconds"], 30)
+                self.assertEqual(created.json()["speechRate"], 1.15)
+                url = created.json()["url"].removeprefix(server.PUBLIC_URL)
+                review = self.client.get(url)
+                self.assertEqual(review.status_code, 200)
+                self.assertEqual(review.content, b"review-video")
+            finally:
+                server.JOBS.pop(job_id, None)
+
+    def test_preview_render_can_be_repeated_before_full_render(self):
+        job_id = "preview-render-state-test"
+        with TemporaryDirectory() as directory:
+            server.JOBS[job_id] = {
+                "id": job_id, "status": "preview_ready", "work_dir": Path(directory),
+            }
+            body = {
+                "voiceMap": {"*": "edge:vi-VN-HoaiMyNeural"},
+                "blurRegions": [], "subtitleRect": {"x": .1, "y": .7, "w": .8, "h": .2},
+                "speechRate": 1.2, "previewOnly": True,
+            }
+            try:
+                with patch.object(server.EXECUTOR, "submit") as submit:
+                    response = self.client.post(f"/api/jobs/{job_id}/render", headers=self.auth, json=body)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(server.JOBS[job_id]["status"], "queued_preview")
+                self.assertTrue(submit.call_args.args[2].previewOnly)
             finally:
                 server.JOBS.pop(job_id, None)
 

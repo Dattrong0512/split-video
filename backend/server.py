@@ -27,7 +27,7 @@ JOBS: dict[str, dict] = {}
 VOICES: dict[str, dict] = {}
 LOCK = threading.RLock()
 
-app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.3.1", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.4.0", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
@@ -45,7 +45,8 @@ def authorize(authorization: str | None = Header(default=None)) -> None:
 def public_job(job: dict) -> dict:
     private = {
         "gemini_key", "cookie_text", "download_token", "download_expires",
-        "preview_token", "preview_expires", "work_dir", "source", "cues", "result",
+        "preview_token", "preview_expires", "review_token", "review_expires",
+        "work_dir", "source", "cues", "result", "review_result", "tts_cache", "background",
     }
     return {key: value for key, value in job.items() if key not in private}
 
@@ -143,9 +144,12 @@ def start_render(job_id: str, request: RenderRequest) -> dict:
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail={"code": "JOB_NOT_FOUND", "message": "Không tìm thấy job."})
-    if job["status"] != "analysis_ready":
+    if job["status"] not in {"analysis_ready", "preview_ready"}:
         raise HTTPException(status_code=409, detail={"code": "JOB_NOT_READY", "message": "Job chưa phân tích xong."})
-    job.update(status="queued_render", message="Đang chờ render…", progress=56)
+    if request.previewOnly:
+        job.update(status="queued_preview", message="Đang chuẩn bị bản xem trước 30 giây…", progress=56)
+    else:
+        job.update(status="queued_render", message="Đang chuẩn bị render toàn bộ…", progress=56)
     EXECUTOR.submit(run_render, job_id, request)
     return {"ok": True}
 
@@ -170,6 +174,31 @@ def preview_video(job_id: str, token: str):
         raise HTTPException(status_code=403, detail="Liên kết xem trước không hợp lệ hoặc đã hết hạn.")
     return FileResponse(
         job["source"], media_type="video/mp4", filename="preview.mp4",
+        content_disposition_type="inline", headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@app.post("/api/jobs/{job_id}/review-token", dependencies=[Depends(authorize)])
+def create_review_token(job_id: str) -> dict:
+    job = JOBS.get(job_id)
+    result_value = job.get("review_result") if job else None
+    result = Path(result_value) if result_value else None
+    if not job or job.get("status") != "preview_ready" or not result or not result.exists():
+        raise HTTPException(status_code=409, detail={"code": "REVIEW_NOT_READY", "message": "Bản xem trước chưa sẵn sàng."})
+    token = secrets.token_urlsafe(24)
+    job["review_token"] = token
+    job["review_expires"] = time.time() + 7200
+    return {"url": f"{PUBLIC_URL}/api/reviews/{job_id}?token={token}", "seconds": min(30, float(job["duration"])),
+            "speechRate": job.get("review_rate", 1.0)}
+
+
+@app.get("/api/reviews/{job_id}")
+def review_video(job_id: str, token: str):
+    job = JOBS.get(job_id)
+    if not job or token != job.get("review_token") or time.time() > job.get("review_expires", 0):
+        raise HTTPException(status_code=403, detail="Liên kết bản xem trước không hợp lệ hoặc đã hết hạn.")
+    return FileResponse(
+        job["review_result"], media_type="video/mp4", filename="review-30s.mp4",
         content_disposition_type="inline", headers={"Cache-Control": "private, max-age=3600"},
     )
 

@@ -164,7 +164,12 @@ testServiceWorkerReinjectsExistingColabTab()
     assert.match(styles, /body\.manual-editor-page #canvas-wrap/);
     assert.match(html, /id="toggle-preview"/);
     assert.match(html, /id="preview-seek"/);
+    assert.match(html, /id="speech-rate"/);
+    assert.match(html, /id="review-video"/);
     assert.match(sidepanel, /\/preview-token/);
+    assert.match(sidepanel, /\/review-token/);
+    assert.match(sidepanel, /previewOnly/);
+    assert.match(sidepanel, /speechRate/);
     assert.match(sidepanel, /DOWNLOAD_PROGRESS/);
     assert.match(canvasEditor, /fitDisplay\(\)/);
     console.log("Extension automation tests passed.");

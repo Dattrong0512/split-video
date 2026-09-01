@@ -28,6 +28,8 @@ class RenderRequest(BaseModel):
     voiceMap: dict[str, str]
     blurRegions: list[Rect] = Field(default_factory=list)
     subtitleRect: Rect
+    speechRate: float = Field(default=1.0, ge=.8, le=1.4)
+    previewOnly: bool = False
 
     @model_validator(mode="after")
     def reasonable_size(self):
