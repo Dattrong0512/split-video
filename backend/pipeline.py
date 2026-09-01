@@ -144,18 +144,18 @@ def transcribe(audio: Path) -> list[dict]:
     return cues
 
 
-def _translation_schema(cue_count: int) -> dict:
+def _translation_schema() -> dict:
     return {
-        "type": "array", "minItems": cue_count, "maxItems": cue_count,
+        "type": "array",
         "items": {
-            "type": "object", "additionalProperties": False,
+            "type": "object",
             "properties": {
                 "id": {"type": "integer"},
-                "original_corrected": {"type": "string", "description": "Chinese transcript corrected from the audio"},
-                "text_vi": {"type": "string", "description": "Concise, faithful Vietnamese sentence that fits the cue duration"},
+                "original_corrected": {"type": "string"},
+                "text_vi": {"type": "string"},
                 "speaker": {"type": "string"},
-                "gender": {"type": "string", "enum": ["male", "female", "unknown"]},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "gender": {"type": "string"},
+                "confidence": {"type": "number"},
             },
             "required": ["id", "original_corrected", "text_vi", "speaker", "gender", "confidence"],
         },
@@ -217,7 +217,7 @@ def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
             model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             contents=[prompt, uploaded],
             config=types.GenerateContentConfig(
-                response_mime_type="application/json", response_json_schema=_translation_schema(len(cues)), temperature=.1,
+                response_mime_type="application/json", response_json_schema=_translation_schema(), temperature=.1,
             ),
         )
         text = response.text or ""

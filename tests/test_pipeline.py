@@ -94,7 +94,13 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertEqual(translated[0]["original_corrected"], "你好")
         self.assertEqual(translated[0]["text_vi"], "Xin chào.")
         self.assertEqual(translated[0]["confidence"], .96)
-        self.assertEqual(_translation_schema(1)["maxItems"], 1)
+
+    def test_translation_schema_stays_simple_for_flash_lite(self):
+        schema = _translation_schema()
+        self.assertNotIn("minItems", schema)
+        self.assertNotIn("maxItems", schema)
+        self.assertNotIn("additionalProperties", schema["items"])
+        self.assertEqual(schema["items"]["properties"]["confidence"], {"type": "number"})
 
     def test_translation_rows_reject_changed_ids(self):
         with self.assertRaises(ValueError):
