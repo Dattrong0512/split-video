@@ -6,7 +6,8 @@ from unittest.mock import MagicMock, patch
 
 from backend.pipeline import (
     DEFAULT_GEMINI_MODEL, PipelineError, _apply_translation_rows, _atempo, _gemini_retry_options,
-    _translation_schema, _v3_ocr_boxes, audio_mix_filter, cluster_rectangles, encoding_options,
+    _old_ocr_rows, _screen_subtitle_text, _translation_cue_payload, _translation_schema,
+    _v3_ocr_boxes, _v3_ocr_rows, audio_mix_filter, cluster_rectangles, encoding_options,
     ensure_portrait_subtitle_blur, plan_dubbing_timeline, transcribe, video_filter, write_ass,
 )
 
@@ -75,6 +76,31 @@ class PipelineHelpersTest(unittest.TestCase):
         boxes = _v3_ocr_boxes([Result()], 200, 100)
         self.assertEqual(boxes, [{"x": .05, "y": .2, "w": .5, "h": .5}])
 
+    def test_reads_paddleocr_v3_text_and_confidence(self):
+        result = {"res": {
+            "rec_boxes": [[20, 60, 180, 80]], "rec_texts": ["这是原字幕"], "rec_scores": [.97],
+        }}
+        rows = _v3_ocr_rows([result], 200, 100)
+        self.assertEqual(rows[0]["text"], "这是原字幕")
+        self.assertAlmostEqual(rows[0]["score"], .97)
+        self.assertEqual(rows[0]["rect"], {"x": .1, "y": .6, "w": .8, "h": .2})
+
+    def test_reads_nested_legacy_paddleocr_text(self):
+        result = [[[[(20, 60), (180, 60), (180, 80), (20, 80)], ("原字幕", .91)]]]
+        rows = _old_ocr_rows(result, 200, 100)
+        self.assertEqual(rows[0]["text"], "原字幕")
+        self.assertAlmostEqual(rows[0]["score"], .91)
+
+    def test_screen_subtitle_prefers_lower_chinese_and_rejects_watermarks(self):
+        rows = [
+            {"rect": {"x": .1, "y": .1, "w": .3, "h": .05}, "text": "顶部水印", "score": .99},
+            {"rect": {"x": .2, "y": .68, "w": .6, "h": .05}, "text": "这是原来的字幕", "score": .96},
+            {"rect": {"x": .2, "y": .76, "w": .6, "h": .05}, "text": "第二行", "score": .95},
+            {"rect": {"x": .2, "y": .7, "w": .6, "h": .05}, "text": "English only", "score": .99},
+            {"rect": {"x": .01, "y": .82, "w": .12, "h": .04}, "text": "角落水印", "score": .99},
+        ]
+        self.assertEqual(_screen_subtitle_text(rows), "这是原来的字幕\n第二行")
+
     def test_whisper_is_constrained_to_chinese_for_douyin(self):
         model = SimpleNamespace(transcribe=MagicMock(return_value=(
             [SimpleNamespace(start=0, end=1, text="你好")], None,
@@ -94,6 +120,14 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertEqual(translated[0]["original_corrected"], "你好")
         self.assertEqual(translated[0]["text_vi"], "Xin chào.")
         self.assertEqual(translated[0]["confidence"], .96)
+
+    def test_translation_payload_grounds_gemini_in_on_screen_subtitle(self):
+        payload = _translation_cue_payload({
+            "id": 2, "start": 1, "end": 2, "original": "错误听写", "screen_text": "准确原字幕",
+        })
+        self.assertEqual(payload["on_screen_subtitle_ocr"], "准确原字幕")
+        self.assertEqual(payload["whisper_transcript"], "错误听写")
+        self.assertEqual(payload["target_vi_characters"], 18)
 
     def test_translation_schema_stays_simple_for_flash_lite(self):
         schema = _translation_schema()
@@ -119,8 +153,14 @@ class PipelineHelpersTest(unittest.TestCase):
     def test_short_and_long_tts_use_natural_speed_limits(self):
         cues = [{"start": 0, "end": 2}, {"start": 2.1, "end": 3}]
         timeline = plan_dubbing_timeline(cues, [.3, 3], 3.2)
-        self.assertAlmostEqual(timeline[0]["speed"], 1.0)
+        self.assertAlmostEqual(timeline[0]["speed"], .90)
         self.assertAlmostEqual(timeline[1]["speed"], 1.15)
+
+    def test_tts_within_natural_range_exactly_matches_original_cue_duration(self):
+        cue = [{"start": 1, "end": 3}]
+        timeline = plan_dubbing_timeline(cue, [2.2], 4)
+        self.assertAlmostEqual(timeline[0]["speed"], 1.1)
+        self.assertAlmostEqual(timeline[0]["end"] - timeline[0]["start"], 2.0)
 
     def test_overflowing_cues_compact_into_pauses_before_video_end(self):
         cues = [{"start": 1, "end": 2}, {"start": 4, "end": 4.5}]

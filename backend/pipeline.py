@@ -23,6 +23,7 @@ class PipelineError(RuntimeError):
 
 _whisper_model = None
 _omnivoice_model = None
+_ocr_model = None
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
@@ -187,6 +188,19 @@ def _apply_translation_rows(cues: list[dict], rows: Any) -> list[dict]:
     return cues
 
 
+def _translation_cue_payload(cue: dict) -> dict:
+    duration = max(.12, float(cue["end"]) - float(cue["start"]))
+    return {
+        "id": cue["id"],
+        "start_seconds": round(float(cue["start"]), 3),
+        "end_seconds": round(float(cue["end"]), 3),
+        "duration_seconds": round(duration, 3),
+        "target_vi_characters": max(12, round(duration * 18)),
+        "on_screen_subtitle_ocr": str(cue.get("screen_text", "")).strip(),
+        "whisper_transcript": cue["original"],
+    }
+
+
 def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
     client = None
     uploaded = None
@@ -202,18 +216,15 @@ def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
         )
         uploaded = client.files.upload(file=str(audio))
         prompt = (
-            "Chỉ dùng âm thanh đính kèm để sửa transcript tiếng Trung và dịch; không suy đoán từ hình ảnh, "
-            "không bịa hoặc thêm ý không có trong lời nói. Giữ nguyên từng id, không bỏ, thêm, gộp hay tách cue. "
-            "Bản dịch tiếng Việt phải đúng nghĩa, tự nhiên, viết hoa kiểu câu bình thường, đủ ngắn để đọc trong "
-            "duration_seconds và không vượt quá max_vi_characters; ưu tiên rút gọn mà không mất ý. "
-            "Gán người nói nhất quán S1, S2... và chỉ suy đoán "
-            "giới tính khi nghe đủ rõ. Dữ liệu cue: " +
-            json.dumps([{
-                "id": cue["id"], "start_seconds": round(cue["start"], 3),
-                "end_seconds": round(cue["end"], 3), "duration_seconds": round(cue["end"] - cue["start"], 3),
-                "max_vi_characters": max(6, round((cue["end"] - cue["start"]) * 14)),
-                "whisper_transcript": cue["original"],
-            } for cue in cues], ensure_ascii=False)
+            "Dịch chính xác từng câu tiếng Trung sang tiếng Việt. on_screen_subtitle_ocr là nguồn nội dung chính "
+            "khi nó khớp với audio của cue: đó là subtitle gốc đọc bằng OCR nên có thể sai vài ký tự; hãy dùng audio đính kèm và "
+            "whisper_transcript để sửa lỗi OCR, tuyệt đối không sáng tác, diễn giải thêm hoặc đưa kiến thức ngoài video. "
+            "Nếu OCR trống thì dựa vào audio và Whisper. original_corrected phải là đúng câu tiếng Trung đã được sửa. "
+            "Giữ nguyên từng id, không bỏ, thêm, gộp hay tách cue. text_vi phải đủ nghĩa, tự nhiên, viết hoa kiểu câu "
+            "bình thường và hướng tới target_vi_characters để đọc vừa duration_seconds; chỉ rút gọn cách diễn đạt, "
+            "không được làm mất chủ thể, hành động, con số hay sự kiện chính. Gán người nói nhất quán S1, S2... và "
+            "chỉ suy đoán giới tính khi nghe đủ rõ. Dữ liệu cue: " +
+            json.dumps([_translation_cue_payload(cue) for cue in cues], ensure_ascii=False)
         )
         response = client.models.generate_content(
             model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
@@ -296,20 +307,40 @@ def ensure_portrait_subtitle_blur(
     return regions[:8]
 
 
-def _old_ocr_boxes(result: Any, width: int, height: int) -> list[dict]:
-    boxes = []
-    rows = result[0] if isinstance(result, list) and result and isinstance(result[0], list) else result
+def _old_ocr_rows(result: Any, width: int, height: int) -> list[dict]:
+    output = []
+    rows = result
+    if isinstance(result, list) and result and isinstance(result[0], list):
+        first = result[0]
+        first_is_row = (len(first) >= 1 and isinstance(first[0], (list, tuple)) and len(first[0]) >= 4
+                        and isinstance(first[0][0], (list, tuple)))
+        if not first_is_row:
+            rows = first
     for row in rows or []:
         if not isinstance(row, (list, tuple)) or not row: continue
         polygon = row[0]
         if not isinstance(polygon, (list, tuple)) or len(polygon) < 4: continue
         xs, ys = [float(p[0]) for p in polygon], [float(p[1]) for p in polygon]
-        boxes.append({"x": min(xs)/width, "y": min(ys)/height, "w": (max(xs)-min(xs))/width, "h": (max(ys)-min(ys))/height})
-    return boxes
+        recognition = row[1] if len(row) > 1 else ()
+        text = str(recognition[0]).strip() if isinstance(recognition, (list, tuple)) and recognition else ""
+        try:
+            score = float(recognition[1]) if len(recognition) > 1 else 0.0
+        except (TypeError, ValueError):
+            score = 0.0
+        output.append({
+            "rect": {"x": min(xs)/width, "y": min(ys)/height,
+                     "w": (max(xs)-min(xs))/width, "h": (max(ys)-min(ys))/height},
+            "text": text, "score": score,
+        })
+    return output
 
 
-def _v3_ocr_boxes(results: Any, width: int, height: int) -> list[dict]:
-    boxes = []
+def _old_ocr_boxes(result: Any, width: int, height: int) -> list[dict]:
+    return [row["rect"] for row in _old_ocr_rows(result, width, height)]
+
+
+def _v3_ocr_rows(results: Any, width: int, height: int) -> list[dict]:
+    output = []
     for result in results or []:
         payload = getattr(result, "json", result)
         if callable(payload):
@@ -320,47 +351,114 @@ def _v3_ocr_boxes(results: Any, width: int, height: int) -> list[dict]:
         rows = data.get("rec_boxes") if isinstance(data, dict) else None
         if rows is None:
             continue
-        for row in rows:
+        texts = data.get("rec_texts", [])
+        scores = data.get("rec_scores", [])
+        for index, row in enumerate(rows):
             if len(row) < 4:
                 continue
             x1, y1, x2, y2 = (float(value) for value in row[:4])
-            boxes.append({"x": x1/width, "y": y1/height, "w": max(0, x2-x1)/width, "h": max(0, y2-y1)/height})
-    return boxes
+            try:
+                score = float(scores[index]) if index < len(scores) else 0.0
+            except (TypeError, ValueError):
+                score = 0.0
+            output.append({
+                "rect": {"x": x1/width, "y": y1/height,
+                         "w": max(0, x2-x1)/width, "h": max(0, y2-y1)/height},
+                "text": str(texts[index]).strip() if index < len(texts) else "", "score": score,
+            })
+    return output
 
 
-def detect_blur_regions(source: Path, duration: float) -> list[dict]:
-    width, height = video_size(source)
-    try:
-        import cv2
-    except Exception:
-        return ensure_portrait_subtitle_blur([], width, height)
-    try:
+def _v3_ocr_boxes(results: Any, width: int, height: int) -> list[dict]:
+    return [row["rect"] for row in _v3_ocr_rows(results, width, height)]
+
+
+def _screen_subtitle_text(rows: list[dict]) -> str:
+    candidates = []
+    for row in rows:
+        rect = row["rect"]
+        text = re.sub(r"\s+", "", str(row.get("text", "")))
+        center_y = rect["y"] + rect["h"] / 2
+        center_x = rect["x"] + rect["w"] / 2
+        if (float(row.get("score", 0)) >= .35 and re.search(r"[\u3400-\u9fff]", text)
+                and .50 <= center_y <= .93 and .18 <= center_x <= .82
+                and rect["w"] >= .04 and rect["h"] >= .009):
+            candidates.append((center_y, rect["x"], text))
+    if not candidates:
+        return ""
+    candidates.sort()
+    lines: list[list[tuple[float, str]]] = []
+    line_centers: list[float] = []
+    for center_y, x, text in candidates:
+        target = next((index for index, value in enumerate(line_centers) if abs(value - center_y) <= .035), None)
+        if target is None:
+            lines.append([(x, text)]); line_centers.append(center_y)
+        else:
+            lines[target].append((x, text))
+    output = []
+    lowest_line = max(line_centers)
+    for line_index, line in enumerate(lines):
+        if line_centers[line_index] < lowest_line - .14:
+            continue
+        value = "".join(text for _x, text in sorted(line))
+        if value and value not in output:
+            output.append(value)
+    return "\n".join(output)
+
+
+def _paddle_ocr():
+    global _ocr_model
+    if _ocr_model is None:
         from paddleocr import PaddleOCR
-        ocr = PaddleOCR(
+        _ocr_model = PaddleOCR(
             lang="ch", ocr_version="PP-OCRv5",
             text_detection_model_name="PP-OCRv5_mobile_det",
             text_recognition_model_name="PP-OCRv5_mobile_rec",
             use_doc_orientation_classify=False, use_doc_unwarping=False,
             use_textline_orientation=False, device="cpu",
         )
+    return _ocr_model
+
+
+def detect_blur_regions(source: Path, duration: float, cues: list[dict] | None = None) -> list[dict]:
+    width, height = video_size(source)
+    try:
+        import cv2
+    except Exception:
+        return ensure_portrait_subtitle_blur([], width, height)
+    try:
+        ocr = _paddle_ocr()
     except Exception:
         ocr = None
-    capture = cv2.VideoCapture(str(source)); sample_count = 24
+    cue_list = cues or []
+    samples: list[dict] = []
+    for cue in cue_list:
+        samples.append({"time": min(duration, max(0, (float(cue["start"]) + float(cue["end"])) / 2)), "cues": [cue]})
+    for index in range(24):
+        timestamp = duration * (index + .5) / 24
+        nearby = next((sample for sample in samples if abs(sample["time"] - timestamp) <= max(.08, duration / 96)), None)
+        if nearby is None:
+            samples.append({"time": timestamp, "cues": []})
+    samples.sort(key=lambda item: item["time"])
+    capture = cv2.VideoCapture(str(source)); sample_count = len(samples)
     text_detections: list[tuple[int, dict]] = []
     color_detections: list[tuple[int, dict]] = []
     try:
-        for index in range(sample_count):
-            capture.set(cv2.CAP_PROP_POS_MSEC, (duration * (index + .5) / sample_count) * 1000)
+        for index, sample in enumerate(samples):
+            capture.set(cv2.CAP_PROP_POS_MSEC, sample["time"] * 1000)
             ok, frame = capture.read()
             if not ok: continue
             frame_height, frame_width = frame.shape[:2]
-            boxes = []
+            rows = []
             if ocr is not None:
                 try:
-                    boxes = _v3_ocr_boxes(ocr.predict(frame), frame_width, frame_height)
+                    rows = _v3_ocr_rows(ocr.predict(frame), frame_width, frame_height)
                 except Exception:
-                    try: boxes = _old_ocr_boxes(ocr.ocr(frame), frame_width, frame_height)
-                    except Exception: boxes = []
+                    try: rows = _old_ocr_rows(ocr.ocr(frame), frame_width, frame_height)
+                    except Exception: rows = []
+            for cue in sample["cues"]:
+                cue["screen_text"] = _screen_subtitle_text(rows)
+            boxes = [row["rect"] for row in rows]
             text_detections.extend((index, rect) for rect in boxes if rect["w"] > .015 and rect["h"] > .008)
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             mask = cv2.inRange(hsv, (85, 55, 45), (140, 255, 255))
@@ -384,12 +482,11 @@ def analyze_job(job: dict, _voices: dict) -> None:
     duration = media_duration(source); dimensions = video_size(source); audio, preview = extract_assets(source, job["work_dir"], duration)
     update(job, 24, "Whisper đang nhận diện lời thoại…")
     cues = transcribe(audio)
-    update(job, 36, "Gemini đang dịch và phân biệt người nói…")
+    update(job, 34, "Đang đọc subtitle tiếng Trung gốc trên từng cảnh…")
+    detected_regions = detect_blur_regions(source, duration, cues)
+    update(job, 46, "Gemini đang đối chiếu subtitle gốc với lời thoại…")
     cues = gemini_translate(cues, audio, job.pop("gemini_key"))
-    regions = []
-    if job["blur_mode"] == "auto":
-        update(job, 46, "Đang tự tìm subtitle gốc và watermark xanh…")
-        regions = detect_blur_regions(source, duration)
+    regions = detected_regions if job["blur_mode"] == "auto" else []
     speakers_by_id = {}
     for cue in cues: speakers_by_id.setdefault(cue["speaker"], cue["gender"])
     speakers = [{"id": key, "gender": value} for key, value in sorted(speakers_by_id.items())]
@@ -421,19 +518,12 @@ def plan_dubbing_timeline(cues: list[dict], generated_durations: list[float], vi
         raise ValueError("Mỗi cue phải có đúng một audio TTS")
     timeline = []
     cursor = 0.0
-    for index, (cue, generated) in enumerate(zip(cues, generated_durations)):
+    for cue, generated in zip(cues, generated_durations):
         start = max(float(cue["start"]), cursor)
-        next_start = float(cues[index + 1]["start"]) if index + 1 < len(cues) else video_duration
-        available = max(.25, max(float(cue["end"]), next_start - gap) - start)
         original_duration = max(.25, float(cue["end"]) - float(cue["start"]))
         generated = max(.05, float(generated))
         ideal_for_original = generated / original_duration
-        if ideal_for_original < .90:
-            speed = 1.0
-        elif ideal_for_original <= 1.15:
-            speed = ideal_for_original
-        else:
-            speed = min(1.15, max(1.0, generated / available))
+        speed = min(1.15, max(.90, ideal_for_original))
         end = start + generated / speed
         timeline.append({"start": start, "end": end, "speed": speed})
         cursor = end + gap
