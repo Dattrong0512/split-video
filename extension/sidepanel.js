@@ -73,7 +73,7 @@ function rebuildVoices() {
 }
 
 async function ensureServer(action) {
-  const stored = await chrome.storage.session.get("serverSession");
+  const stored = await chrome.storage.session.get(["serverSession", "colabProgress"]);
   state.server = state.server || stored.serverSession || null;
   if (state.server) {
     try {
@@ -81,11 +81,12 @@ async function ensureServer(action) {
       state.voices = health.voices || [];
       rebuildVoices();
       return true;
-    } catch (_) { state.server = null; await chrome.storage.session.remove("serverSession"); }
+    } catch (_) { state.server = null; stored.colabProgress = null; await chrome.storage.session.remove(["serverSession", "colabProgress"]); }
   }
   state.pending = action;
-  setStatus("Đang mở Google Colab. Nếu cần, bấm nút đỏ “Khởi động Douyin Dubbing” trong notebook.", 3);
-  await chrome.runtime.sendMessage({ type: "OPEN_COLAB" });
+  setStatus(stored.colabProgress?.message || "Đang mở Google Colab và yêu cầu GPU T4…", stored.colabProgress?.progress || 3);
+  const opened = await chrome.runtime.sendMessage({ type: "OPEN_COLAB" });
+  if (opened?.reused) setStatus("Đã chuyển tới tab Colab đang chạy; không mở thêm tab mới.", Math.max(5, stored.colabProgress?.progress || 0));
   return false;
 }
 
@@ -197,5 +198,6 @@ $("#delete-clone").addEventListener("click", async () => { const value = $("#def
 $("#choose-clone").addEventListener("click", (event) => { event.preventDefault(); if (!$("#clone-name").value.trim()) { $("#clone-name").focus(); return; } $("#clone-dialog").close(); $("#clone-file").click(); });
 $("#clone-file").addEventListener("change", async (event) => { const file = event.target.files[0]; if (!file) return; try { const audio = new Audio(URL.createObjectURL(file)); await new Promise((resolve, reject) => { audio.onloadedmetadata = resolve; audio.onerror = reject; }); if (audio.duration < 3 || audio.duration > 10.5) throw new Error("Clip clone phải dài từ 3 đến 10 giây."); const record = { id: crypto.randomUUID(), name: $("#clone-name").value.trim(), fileName: file.name, type: file.type, blob: file, duration: audio.duration }; await saveClone(record); state.clones.push(record); rebuildVoices(); $("#default-voice").value = `clone:${record.id}`; setStatus(`Đã lưu giọng clone “${record.name}”.`); } catch (error) { setStatus(error.message || "Không đọc được clip clone."); } event.target.value = ""; });
 chrome.runtime.onMessage.addListener((message) => { if (message?.type === "SERVER_SESSION_UPDATED") { state.server = message.payload; setStatus("Colab đã sẵn sàng. Đang tiếp tục…", 4); const action = state.pending; state.pending = null; if (action === "analyze") analyze(); else if (action === "render") render(); } });
+chrome.runtime.onMessage.addListener((message) => { if (message?.type === "COLAB_PROGRESS_UPDATED" && state.pending) setStatus(message.payload.message, message.payload.progress); });
 
 initialize();

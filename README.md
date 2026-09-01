@@ -24,6 +24,12 @@ Chrome extension lấy video Douyin đang hiển thị, tạo phụ đề và l�
 5. Sau phân tích, kiểm tra nhiều khung blur màu hồng và một khung phụ đề màu xanh. Nếu có nhiều người nói, chọn giọng riêng cho từng S1/S2…
 6. Bấm **Tạo lồng tiếng & tải xuống**. Giữ tab Colab mở cho tới khi Chrome bắt đầu tải file.
 
+### Vì sao lần đầu chạy lâu?
+
+- Extension tái sử dụng đúng một tab Colab, yêu cầu GPU T4 và hiển thị các bước kết nối/cài thư viện/tạo tunnel ngay trong side panel.
+- Lần chạy đầu thường mất vài phút vì Colab phải cài thư viện AI. Khi phân tích hoặc clone giọng lần đầu, Whisper, PaddleOCR, Demucs và OmniVoice còn phải tải model.
+- Cell cuối sẽ kết thúc sau khi server sẵn sàng; tiến trình API và Cloudflare Tunnel vẫn chạy nền. Dòng `NEKO_SERVER_READY` mới là tín hiệu extension bắt đầu xử lý video.
+
 ## Kiến trúc và bảo mật
 
 - `extension/`: Manifest V3 side panel, Douyin/Colab content scripts, canvas editor và storage cục bộ.

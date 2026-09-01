@@ -14,6 +14,10 @@ class ServerContractTest(unittest.TestCase):
     def test_health_requires_bearer_token(self):
         self.assertEqual(self.client.get("/api/health").status_code, 401)
 
+    def test_api_documentation_is_not_public(self):
+        self.assertEqual(self.client.get("/docs").status_code, 404)
+        self.assertEqual(self.client.get("/openapi.json").status_code, 404)
+
     def test_health_lists_vietnamese_presets(self):
         response = self.client.get("/api/health", headers=self.auth)
         self.assertEqual(response.status_code, 200)
