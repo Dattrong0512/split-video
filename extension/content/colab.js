@@ -5,15 +5,24 @@ let lastProgress = "";
 let automationAttempts = 0;
 let automationTimer = null;
 let runAllRequested = false;
+let cachedRoots = [document];
+let rootsExpireAt = 0;
+
+function roots() {
+  if (Date.now() < rootsExpireAt) return cachedRoots;
+  const found = [document];
+  for (let index = 0; index < found.length; index += 1) {
+    for (const element of found[index].querySelectorAll("*")) {
+      if (element.shadowRoot && !found.includes(element.shadowRoot)) found.push(element.shadowRoot);
+    }
+  }
+  cachedRoots = found;
+  rootsExpireAt = Date.now() + 60000;
+  return cachedRoots;
+}
 
 function allElements(selector) {
-  const output = [];
-  const visit = (root) => {
-    output.push(...root.querySelectorAll(selector));
-    for (const element of root.querySelectorAll("*")) if (element.shadowRoot) visit(element.shadowRoot);
-  };
-  visit(document);
-  return output;
+  return roots().flatMap((root) => [...root.querySelectorAll(selector)]);
 }
 
 function elementLabel(element) {
@@ -21,6 +30,8 @@ function elementLabel(element) {
 }
 
 function findControl(pattern, selectors = "button, [role=button], [role=menuitem], colab-toolbar-button") {
+  const direct = [...document.querySelectorAll(selectors)].find((element) => pattern.test(elementLabel(element)) && !element.disabled);
+  if (direct) return direct;
   return allElements(selectors).find((element) => pattern.test(elementLabel(element)) && !element.disabled);
 }
 
@@ -34,23 +45,27 @@ function sendProgress(payload) {
 }
 
 function pageText() {
-  return [document.body?.innerText || "", ...allElements("colab-output, [role=status]").map(elementLabel)].join("\n");
+  return document.body?.textContent || "";
 }
 
-function scanNotebookOutput() {
-  const text = pageText();
+function scanNotebookOutput(text) {
   let match;
+  let newestProgress = null;
   PROGRESS_PATTERN.lastIndex = 0;
   while ((match = PROGRESS_PATTERN.exec(text))) {
-    try { sendProgress(JSON.parse(match[1])); } catch (_) {}
+    newestProgress = match[1];
   }
+  if (newestProgress) try { sendProgress(JSON.parse(newestProgress)); } catch (_) {}
+  let newestHandshake = null;
   READY_PATTERN.lastIndex = 0;
   while ((match = READY_PATTERN.exec(text))) {
-    if (match[1] === lastHandshake) continue;
+    newestHandshake = match[1];
+  }
+  if (newestHandshake && newestHandshake !== lastHandshake) {
     try {
-      const payload = JSON.parse(match[1]);
+      const payload = JSON.parse(newestHandshake);
       if (payload.url?.startsWith("https://") && payload.token) {
-        lastHandshake = match[1];
+        lastHandshake = newestHandshake;
         chrome.runtime.sendMessage({ type: "COLAB_READY", payload });
       }
     } catch (_) {}
@@ -77,10 +92,9 @@ function clickRunAll() {
   return true;
 }
 
-function automateColab() {
+function automateColab(text) {
   if (lastHandshake || automationAttempts >= 100) return;
   automationAttempts += 1;
-  const text = pageText();
   if (/allocating|connecting|initializing|đang kết nối|đang phân bổ/i.test(text)) {
     sendProgress({ stage: "connecting", progress: 10, message: "Đang kết nối Colab và yêu cầu GPU T4…" });
     return;
@@ -115,6 +129,7 @@ function installHelper() {
   helper.addEventListener("click", () => {
     automationAttempts = 0;
     runAllRequested = false;
+    rootsExpireAt = 0;
     const clicked = clickConfirmation() || clickRunAll();
     sendProgress({ stage: clicked ? "run-all" : "manual", progress: clicked ? 15 : 5, message: clicked ? "Đã gửi lệnh Run all…" : "Chọn Runtime → Run all một lần." });
   });
@@ -123,11 +138,11 @@ function installHelper() {
 
 function tick() {
   installHelper();
-  scanNotebookOutput();
-  automateColab();
+  const text = pageText();
+  scanNotebookOutput(text);
+  automateColab(text);
   clearTimeout(automationTimer);
-  automationTimer = setTimeout(tick, lastHandshake ? 5000 : 1800);
+  automationTimer = setTimeout(tick, lastHandshake ? 5000 : 2000);
 }
 
-new MutationObserver(() => scanNotebookOutput()).observe(document.documentElement, { childList: true, subtree: true });
 tick();
