@@ -3,6 +3,8 @@ import unittest
 from fastapi.testclient import TestClient
 
 import backend.server as server
+from backend.models import Rect, RenderRequest
+from pydantic import ValidationError
 
 
 class ServerContractTest(unittest.TestCase):
@@ -35,6 +37,35 @@ class ServerContractTest(unittest.TestCase):
         self.assertEqual(allowed.headers.get("access-control-allow-origin"), "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         denied = self.client.options("/api/health", headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "GET"})
         self.assertNotEqual(denied.headers.get("access-control-allow-origin"), "https://evil.example")
+
+    def test_rectangles_must_stay_inside_video(self):
+        with self.assertRaises(ValidationError):
+            Rect(x=.9, y=.1, w=.2, h=.2)
+
+    def test_render_request_limits_blur_count(self):
+        with self.assertRaises(ValidationError):
+            RenderRequest(
+                voiceMap={"*": "edge:vi-VN-HoaiMyNeural"},
+                blurRegions=[{"x": 0, "y": 0, "w": .1, "h": .1}] * 21,
+                subtitleRect={"x": .1, "y": .7, "w": .8, "h": .2},
+            )
+
+    def test_analysis_rejects_non_canonical_url(self):
+        response = self.client.post("/api/jobs/analyze", headers=self.auth, json={
+            "canonicalUrl": "https://evil.example/video/7674912144722875109",
+            "cookieText": "cookie",
+            "geminiApiKey": "not-a-real-key",
+            "blurMode": "auto",
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"]["code"], "INVALID_URL")
+
+    def test_public_job_never_returns_credentials(self):
+        public = server.public_job({
+            "id": "job", "gemini_key": "secret-key", "cookie_text": "secret-cookie",
+            "download_token": "secret-token", "message": "ok",
+        })
+        self.assertEqual(public, {"id": "job", "message": "ok"})
 
 
 if __name__ == "__main__":

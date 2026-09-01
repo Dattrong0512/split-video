@@ -27,7 +27,7 @@ JOBS: dict[str, dict] = {}
 VOICES: dict[str, dict] = {}
 LOCK = threading.RLock()
 
-app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.1.0", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
@@ -49,7 +49,11 @@ def public_job(job: dict) -> dict:
 def fail_job(job_id: str, error: Exception) -> None:
     code = error.code if isinstance(error, PipelineError) else "PROCESSING_FAILED"
     with LOCK:
-        JOBS[job_id].update(status="failed", message=str(error), error={"code": code, "message": str(error)})
+        job = JOBS[job_id]
+        job.pop("gemini_key", None)
+        job.pop("cookie_text", None)
+        job.update(status="failed", message=str(error), error={"code": code, "message": str(error)})
+    shutil.rmtree(job["work_dir"], ignore_errors=True)
 
 
 def run_analysis(job_id: str) -> None:
@@ -110,9 +114,17 @@ async def create_voice(name: str = Form(...), file: UploadFile = File(...)) -> d
         raise HTTPException(status_code=400, detail={"code": "INVALID_VOICE", "message": "Định dạng clip giọng không hỗ trợ."})
     voice_id = uuid.uuid4().hex
     path = WORK_ROOT / f"voice-{voice_id}{suffix}"
-    with path.open("wb") as output:
-        while chunk := await file.read(1024 * 1024):
-            output.write(chunk)
+    size = 0
+    try:
+        with path.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > 25 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail={"code": "VOICE_TOO_LARGE", "message": "Clip giọng vượt quá 25 MB."})
+                output.write(chunk)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
     try:
         transcript, duration = probe_reference(path)
     except Exception as error:

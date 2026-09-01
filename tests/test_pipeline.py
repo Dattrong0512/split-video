@@ -1,6 +1,6 @@
 import unittest
 
-from backend.pipeline import PipelineError, _atempo, cluster_rectangles
+from backend.pipeline import PipelineError, _atempo, _v3_ocr_boxes, cluster_rectangles
 
 
 class PipelineHelpersTest(unittest.TestCase):
@@ -26,6 +26,12 @@ class PipelineHelpersTest(unittest.TestCase):
     def test_pipeline_error_keeps_public_code(self):
         error = PipelineError("COOKIE_EXPIRED", "expired")
         self.assertEqual(error.code, "COOKIE_EXPIRED")
+
+    def test_reads_paddleocr_v3_boxes(self):
+        class Result:
+            json = {"res": {"rec_boxes": [[10, 20, 110, 70]]}}
+        boxes = _v3_ocr_boxes([Result()], 200, 100)
+        self.assertEqual(boxes, [{"x": .05, "y": .2, "w": .5, "h": .5}])
 
 
 if __name__ == "__main__":

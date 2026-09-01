@@ -19,15 +19,16 @@ Chrome extension lấy video Douyin đang hiển thị, tạo phụ đề và l�
 
 1. Mở video trên `douyin.com`; có thể là trang feed/discover hoặc URL `/video/<id>`.
 2. Bấm biểu tượng extension để mở side panel. Extension tự lấy URL chuẩn của video đang phát.
-3. Chọn preset Hoài My/Nam Minh hoặc thêm voice clone, rồi bấm **Phân tích video**.
-4. Extension mở `OmniVoice_API.ipynb` trên Colab và thử chạy toàn bộ notebook. Nếu Colab thay đổi giao diện, bấm nút đỏ trong notebook hoặc **Runtime → Run all** một lần.
-5. Sau phân tích, kiểm tra nhiều khung blur màu hồng và một khung phụ đề màu xanh. Nếu có nhiều người nói, chọn giọng riêng cho từng S1/S2…
-6. Bấm **Tạo lồng tiếng & tải xuống**. Giữ tab Colab mở cho tới khi Chrome bắt đầu tải file.
+3. Chọn preset Hoài My/Nam Minh hoặc thêm voice clone. Giữ chế độ **Tự động** và bấm **Tải & lồng tiếng** đúng một lần.
+4. Extension tự mở hoặc dùng lại đúng tab `OmniVoice_API.ipynb`, kết nối GPU T4, chạy notebook, xử lý video và yêu cầu Chrome tải MP4. Giữ tab Colab mở cho tới khi tải bắt đầu.
+
+Chế độ **Chỉnh thủ công** là ngoại lệ có chủ ý: quy trình sẽ dừng sau phân tích để hiện một canvas, cho phép tạo nhiều khung blur màu hồng và đúng một khung subtitle màu xanh; sau đó cần bấm nút tạo video.
 
 ### Vì sao lần đầu chạy lâu?
 
-- Extension tái sử dụng đúng một tab Colab, yêu cầu GPU T4 và hiển thị các bước kết nối/cài thư viện/tạo tunnel ngay trong side panel.
+- Extension tái sử dụng đúng một tab Colab, yêu cầu GPU T4 và hiển thị các bước kết nối/cài thư viện/tạo tunnel ngay trong side panel. Nó cũng tự tiêm lại script vào tab Colab/Douyin đã mở sau khi reload extension.
 - Lần chạy đầu thường mất vài phút vì Colab phải cài thư viện AI. Khi phân tích hoặc clone giọng lần đầu, Whisper, PaddleOCR, Demucs và OmniVoice còn phải tải model.
+- Trong cùng một runtime Colab, dependency được cache theo nội dung `requirements-colab.txt`; chạy lại không cài toàn bộ từ đầu.
 - Cell cuối sẽ kết thúc sau khi server sẵn sàng; tiến trình API và Cloudflare Tunnel vẫn chạy nền. Dòng `NEKO_SERVER_READY` mới là tín hiệu extension bắt đầu xử lý video.
 
 ## Kiến trúc và bảo mật
@@ -48,6 +49,7 @@ node --check extension/service-worker.js
 node --check extension/sidepanel.js
 node --check extension/content/douyin.js
 node --check extension/content/colab.js
+node tests/test_extension.js
 ```
 
 Chỉ tải, chỉnh sửa và clone giọng đối với nội dung bạn sở hữu hoặc được chủ sở hữu cho phép.

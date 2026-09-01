@@ -109,6 +109,8 @@ def transcribe(audio: Path) -> list[dict]:
 
 
 def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
+    client = None
+    uploaded = None
     try:
         from google import genai
         from google.genai import types
@@ -123,7 +125,7 @@ def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
         response = client.models.generate_content(
             model=os.environ.get("GEMINI_MODEL", "gemini-3.7-flash"),
             contents=[prompt, uploaded],
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1),
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
         text = response.text or ""
     except Exception as error:
@@ -131,6 +133,12 @@ def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
         if "api key" in value or "401" in value or "403" in value:
             raise PipelineError("INVALID_GEMINI_KEY", "Gemini API key không hợp lệ hoặc đã bị khóa.") from error
         raise PipelineError("GEMINI_FAILED", f"Gemini không xử lý được audio: {error}") from error
+    finally:
+        if client is not None and uploaded is not None and getattr(uploaded, "name", None):
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
     try:
         rows = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I))
         by_id = {int(row["id"]): row for row in rows}
@@ -189,6 +197,26 @@ def _old_ocr_boxes(result: Any, width: int, height: int) -> list[dict]:
     return boxes
 
 
+def _v3_ocr_boxes(results: Any, width: int, height: int) -> list[dict]:
+    boxes = []
+    for result in results or []:
+        payload = getattr(result, "json", result)
+        if callable(payload):
+            payload = payload()
+        if not isinstance(payload, dict):
+            continue
+        data = payload.get("res", payload)
+        rows = data.get("rec_boxes") if isinstance(data, dict) else None
+        if rows is None:
+            continue
+        for row in rows:
+            if len(row) < 4:
+                continue
+            x1, y1, x2, y2 = (float(value) for value in row[:4])
+            boxes.append({"x": x1/width, "y": y1/height, "w": max(0, x2-x1)/width, "h": max(0, y2-y1)/height})
+    return boxes
+
+
 def detect_blur_regions(source: Path, duration: float) -> list[dict]:
     try:
         import cv2
@@ -196,18 +224,29 @@ def detect_blur_regions(source: Path, duration: float) -> list[dict]:
     except Exception:
         return []
     try:
-        ocr = PaddleOCR(lang="ch", use_angle_cls=False, show_log=False)
-    except TypeError:
-        ocr = PaddleOCR(lang="ch")
-    capture = cv2.VideoCapture(str(source)); sample_count = 24; detections = []
+        ocr = PaddleOCR(
+            lang="ch", ocr_version="PP-OCRv5",
+            text_detection_model_name="PP-OCRv5_mobile_det",
+            text_recognition_model_name="PP-OCRv5_mobile_rec",
+            use_doc_orientation_classify=False, use_doc_unwarping=False,
+            use_textline_orientation=False, device="cpu",
+        )
+    except Exception:
+        ocr = None
+    capture = cv2.VideoCapture(str(source)); sample_count = 16; detections = []
     try:
         for index in range(sample_count):
             capture.set(cv2.CAP_PROP_POS_MSEC, (duration * (index + .5) / sample_count) * 1000)
             ok, frame = capture.read()
             if not ok: continue
             height, width = frame.shape[:2]
-            try: boxes = _old_ocr_boxes(ocr.ocr(frame, cls=False), width, height)
-            except Exception: boxes = []
+            boxes = []
+            if ocr is not None:
+                try:
+                    boxes = _v3_ocr_boxes(ocr.predict(frame), width, height)
+                except Exception:
+                    try: boxes = _old_ocr_boxes(ocr.ocr(frame), width, height)
+                    except Exception: boxes = []
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             mask = cv2.inRange(hsv, (85, 55, 45), (140, 255, 255))
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -278,8 +317,9 @@ def synthesize_cue(text: str, voice: str, raw: Path, voices: dict) -> None:
         raise PipelineError("VOICE_FAILED", "Giọng đã chọn không tồn tại trong phiên Colab.")
     import soundfile as sf
     reference = voices[voice[6:]]
-    audio = _omnivoice().generate(text=text, language="vi", ref_audio=str(reference["path"]), ref_text=reference["transcript"], num_step=16)[0]
-    sf.write(str(raw), audio, 24000)
+    model = _omnivoice()
+    audio = model.generate(text=text, language="vi", ref_audio=str(reference["path"]), ref_text=reference["transcript"], num_step=16)[0]
+    sf.write(str(raw), audio, model.sampling_rate)
 
 
 def create_dubbing(job: dict, request, voices: dict) -> Path:
