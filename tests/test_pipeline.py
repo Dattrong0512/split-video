@@ -10,8 +10,9 @@ from backend.pipeline import (
     DEFAULT_GEMINI_MODEL, TTS_CACHE_VERSION, PipelineError, _apply_translation_rows, _atempo, _gemini_retry_options,
     _old_ocr_rows, _screen_subtitle_text, _translation_cue_payload, _translation_prompt, _translation_schema,
     _v3_ocr_boxes, _v3_ocr_rows, audio_mix_filter, cluster_rectangles, encoding_options, media_duration,
-    ensure_portrait_subtitle_blur, original_bed_filter, plan_dubbing_timeline, transcribe,
-    render_job, repeated_tts_tail_cutoff, synthesize_cue, video_filter, write_ass,
+    ensure_portrait_subtitle_blur, plan_dubbing_timeline, transcribe,
+    render_job, repeated_tts_tail_cutoff, synthesize_cue, synthesize_verified_clone, tts_text_score,
+    video_filter, write_ass,
 )
 
 
@@ -143,11 +144,6 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertNotIn("audio đính kèm", prompt)
         self.assertIn("start_seconds, end_seconds", prompt)
 
-    def test_original_voice_is_kept_quietly_below_dub(self):
-        filters = original_bed_filter()
-        self.assertIn("[1:a]volume=0.12[original_voice]", filters)
-        self.assertIn("amix=inputs=2:duration=longest", filters)
-
     def test_translation_schema_stays_simple_for_flash_lite(self):
         schema = _translation_schema()
         self.assertNotIn("minItems", schema)
@@ -226,6 +222,49 @@ class PipelineHelpersTest(unittest.TestCase):
             SimpleNamespace(word="sao", start=.22, end=.45),
         ]
         self.assertIsNone(repeated_tts_tail_cutoff("Tại sao?", words))
+
+    def test_transcript_gate_rejects_repeated_sao_even_after_long_correct_line(self):
+        expected = "Tôi không biết vì sao chuyện này lại xảy ra và mọi người đều rất bất ngờ."
+        recognized = expected + " Sao sao sao."
+        self.assertLess(tts_text_score(expected, recognized), .68)
+
+    def test_transcript_gate_accepts_clean_vietnamese_line(self):
+        text = "Tôi không biết tại sao."
+        self.assertEqual(tts_text_score(text, text), 1.0)
+
+    def test_bad_clone_attempts_fall_back_instead_of_shipping_repeated_words(self):
+        with TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw.wav"
+
+            def fake_synthesize(_text, voice, path, _voices, target_duration=None):
+                path.write_bytes(b"edge" if voice.startswith("edge:") else b"clone")
+
+            with patch("backend.pipeline.synthesize_cue", side_effect=fake_synthesize), \
+                    patch("backend.pipeline.trim_repeated_tts_tail", return_value=False), \
+                    patch("backend.pipeline.tts_transcript_score", side_effect=[.31, .44, .38]):
+                score, fallback = synthesize_verified_clone(
+                    "Đây là câu đúng.", "clone:test", raw, {}, 1.2,
+                )
+            self.assertTrue(fallback)
+            self.assertAlmostEqual(score, .44)
+            self.assertEqual(raw.read_bytes(), b"edge")
+
+    def test_verified_clone_is_used_without_fallback(self):
+        with TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw.wav"
+
+            def fake_synthesize(_text, _voice, path, _voices, target_duration=None):
+                path.write_bytes(b"clean-clone")
+
+            with patch("backend.pipeline.synthesize_cue", side_effect=fake_synthesize), \
+                    patch("backend.pipeline.trim_repeated_tts_tail", return_value=True), \
+                    patch("backend.pipeline.tts_transcript_score", return_value=.91):
+                score, fallback = synthesize_verified_clone(
+                    "Đây là câu đúng.", "clone:test", raw, {}, 1.2,
+                )
+            self.assertFalse(fallback)
+            self.assertAlmostEqual(score, .91)
+            self.assertEqual(raw.read_bytes(), b"clean-clone")
 
     def test_overflowing_cues_compact_into_pauses_before_video_end(self):
         cues = [{"start": 1, "end": 2}, {"start": 4, "end": 4.5}]

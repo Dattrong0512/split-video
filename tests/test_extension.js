@@ -97,7 +97,7 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   let tabUpdatedListener;
   const event = () => ({ addListener: () => {} });
   const context = {
-    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.4.4" }) }),
+    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.4.5" }) }),
     AbortSignal: { timeout: () => ({}) },
     setTimeout: (callback) => { callback(); return 1; },
     chrome: {

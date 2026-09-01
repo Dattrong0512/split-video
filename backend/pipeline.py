@@ -26,7 +26,7 @@ class PipelineError(RuntimeError):
 _whisper_model = None
 _omnivoice_model = None
 _ocr_model = None
-TTS_CACHE_VERSION = 3
+TTS_CACHE_VERSION = 4
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
@@ -569,6 +569,76 @@ def trim_repeated_tts_tail(path: Path, text: str) -> bool:
         return False
 
 
+def tts_text_score(expected_text: str, recognized_text: str) -> float:
+    expected = _spoken_tokens(expected_text)
+    recognized = _spoken_tokens(recognized_text)
+    if not expected or not recognized:
+        return 0.0
+    matcher = difflib.SequenceMatcher(None, expected, recognized)
+    blocks = [block for block in matcher.get_matching_blocks() if block.size]
+    matching = sum(block.size for block in blocks)
+    score = matching / max(len(expected), len(recognized))
+
+    tail_token = recognized[-1]
+    recognized_suffix = 0
+    for token in reversed(recognized):
+        if token != tail_token:
+            break
+        recognized_suffix += 1
+    expected_suffix = 0
+    for token in reversed(expected):
+        if token != tail_token:
+            break
+        expected_suffix += 1
+    if recognized_suffix >= 2 and recognized_suffix > expected_suffix:
+        return min(score, .4)
+
+    last_match_end = max((block.b + block.size for block in blocks), default=0)
+    if len(recognized) - last_match_end >= 2:
+        return min(score, .4)
+    return score
+
+
+def tts_transcript_score(path: Path, text: str) -> float:
+    try:
+        segments, _ = _whisper().transcribe(
+            str(path), language="vi", vad_filter=True, beam_size=1,
+            word_timestamps=False, condition_on_previous_text=False,
+        )
+        recognized = " ".join(segment.text for segment in segments)
+        return tts_text_score(text, recognized)
+    except Exception:
+        return 0.0
+
+
+def synthesize_verified_clone(
+    text: str, voice: str, raw: Path, voices: dict, target_duration: float,
+    attempts: int = 3,
+) -> tuple[float, bool]:
+    candidates = []
+    best_path = None
+    best_score = -1.0
+    try:
+        for attempt in range(attempts):
+            candidate = raw.with_name(f"{raw.stem}-attempt-{attempt + 1}.wav")
+            candidates.append(candidate)
+            synthesize_cue(text, voice, candidate, voices, target_duration=target_duration)
+            trim_repeated_tts_tail(candidate, text)
+            score = tts_transcript_score(candidate, text)
+            if score > best_score:
+                best_path, best_score = candidate, score
+            if score >= .82:
+                break
+        if best_path is not None and best_score >= .68:
+            shutil.copyfile(best_path, raw)
+            return best_score, False
+        synthesize_cue(text, "edge:vi-VN-HoaiMyNeural", raw, voices)
+        return best_score, True
+    finally:
+        for candidate in candidates:
+            candidate.unlink(missing_ok=True)
+
+
 def plan_dubbing_timeline(
     cues: list[dict], generated_durations: list[float], video_duration: float,
     gap: float = .04, speech_rate: float = 1.0,
@@ -651,9 +721,17 @@ def create_dubbing(job: dict, request, voices: dict, duration_limit: float | Non
                 or cached.get("text") != cue["text_vi"] or not raw.exists()):
             update(job, 62 + index / max(1, total) * 12, f"Đang tạo giọng Việt {index}/{total} ({cue['speaker']})…")
             cue_duration = max(.35, float(cue["end"]) - float(cue["start"]))
-            synthesize_cue(cue["text_vi"], voice, raw, voices, target_duration=cue_duration)
             if voice.startswith("clone:"):
-                trim_repeated_tts_tail(raw, cue["text_vi"])
+                score, used_fallback = synthesize_verified_clone(
+                    cue["text_vi"], voice, raw, voices, cue_duration,
+                )
+                if used_fallback:
+                    job.setdefault("warnings", []).append(
+                        f"Cue {cue['id']} của voice clone không đọc đúng văn bản (score {score:.2f}); "
+                        "đã dùng giọng Việt sạch để tránh lặp từ."
+                    )
+            else:
+                synthesize_cue(cue["text_vi"], voice, raw, voices, target_duration=cue_duration)
             cache[cache_key] = {
                 "version": TTS_CACHE_VERSION, "voice": voice,
                 "text": cue["text_vi"], "duration": media_duration(raw),
@@ -683,38 +761,23 @@ def create_dubbing(job: dict, request, voices: dict, duration_limit: float | Non
     return output, cues
 
 
-def original_bed_filter() -> str:
-    return (
-        "[0:a]volume=1.0[background]"
-        ";[1:a]volume=0.12[original_voice]"
-        ";[background][original_voice]amix=inputs=2:duration=longest:normalize=0,"
-        "alimiter=limit=.95[bed]"
-    )
-
-
 def separate_background(job: dict) -> Path:
     cached = job.get("background")
     if cached and Path(cached).exists():
         return Path(cached)
     output = job["work_dir"] / "separated"
-    update(job, 79, "Đang giữ nhạc, hiệu ứng và một ít giọng nói gốc…")
+    update(job, 79, "Đang tách sạch giọng gốc, chỉ giữ nhạc và hiệu ứng…")
     result = subprocess.run([sys.executable, "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs", "-o", str(output), str(job["source"])], capture_output=True, text=True)
     candidates = list(output.glob("**/no_vocals.wav"))
     background = candidates[0] if candidates else None
-    vocals = background.with_name("vocals.wav") if background is not None else None
-    if result.returncode or background is None or vocals is None or not vocals.exists():
+    if result.returncode or background is None:
         fallback = job["work_dir"] / "background.wav"
-        run([ffmpeg(), "-y", "-i", str(job["source"]), "-vn", "-af", "volume=0.12", str(fallback)], "AUDIO_SEPARATION_FAILED")
-        job["warning"] = "Demucs không tách được vocal; đã dùng âm thanh gốc ở mức 12%."
+        run([ffmpeg(), "-y", "-i", str(job["source"]), "-vn", "-af", "volume=0", str(fallback)], "AUDIO_SEPARATION_FAILED")
+        job["warning"] = "Demucs không tách được vocal; đã tắt audio nguồn để không lọt giọng gốc."
         job["background"] = fallback
         return fallback
-    bed = job["work_dir"] / "background-with-original-voice.wav"
-    run([
-        ffmpeg(), "-y", "-i", str(background), "-i", str(vocals),
-        "-filter_complex", original_bed_filter(), "-map", "[bed]", str(bed),
-    ], "AUDIO_SEPARATION_FAILED")
-    job["background"] = bed
-    return bed
+    job["background"] = background
+    return background
 
 
 def ass_time(value: float) -> str:
