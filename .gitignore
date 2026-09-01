@@ -15,7 +15,10 @@ render_jobs/
 cookies*.txt
 cookie*.txt
 
-# Build artifacts and generated binaries
+# Colab/backend jobs and downloaded media
+douyin-dubbing-jobs/
+
+# Legacy build artifacts
 build/
 dist/
 release/
