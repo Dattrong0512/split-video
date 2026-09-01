@@ -20,10 +20,14 @@ Chrome extension lấy video Douyin đang hiển thị, tạo phụ đề và l�
 1. Mở video trên `douyin.com`; có thể là trang feed/discover hoặc URL `/video/<id>`.
 2. Bấm biểu tượng extension để mở side panel. Extension tự lấy URL chuẩn của video đang phát.
 3. Chọn preset Hoài My/Nam Minh hoặc thêm voice clone. Giữ chế độ **Tự động** và bấm phân tích.
-4. Extension tự tạo bản xem trước 30 giây. Bấm **Mở preview lớn trong tab riêng** nếu cần xem toàn khung hình; tab lớn vẫn có thanh tốc độ và nút xuất. Kéo tốc độ giọng trong khoảng 0,80–1,40× để nghe phản hồi tức thì; khi thả thanh, extension tự tạo lại preview chính xác. Khi đã khớp giọng gốc, bấm xuất toàn bộ video.
-5. Extension tự mở hoặc dùng lại đúng tab `OmniVoice_API.ipynb`, kết nối GPU T4, chạy notebook, xử lý video và yêu cầu Chrome tải MP4. Giữ tab Colab mở cho tới khi tải bắt đầu.
+4. Extension tự tạo bản xem trước 30 giây và tự dừng video Douyin gốc để âm thanh không phát chồng. Bấm **Mở preview lớn trong tab riêng** nếu cần xem toàn khung hình; player nhỏ sẽ dừng và tab lớn tiếp tục đúng câu/thời điểm hiện tại. Tab lớn vẫn có thanh tốc độ và nút xuất. Kéo tốc độ giọng trong khoảng 0,80–1,40× để nghe phản hồi tức thì; khi thả thanh, extension tự tạo lại preview chính xác rồi tiếp tục ở vị trí đang nghe. Khi đã khớp giọng gốc, bấm xuất toàn bộ video.
+5. Bạn có thể bấm **Run all** trong `OmniVoice_API.ipynb` trước rồi mới bấm **Phân tích video**. Extension sẽ gắn vào đúng tab Colab đang mở và dùng server đã chạy; nó không refresh notebook hoặc mở thêm tab. Nếu chưa có notebook, extension mới tự mở một tab, kết nối GPU T4 và chạy notebook. Giữ tab Colab mở cho tới khi tải bắt đầu.
 
 Pipeline dùng Whisper nhận dạng lời nói rồi để Gemini sửa transcript và viết lại tiếng Việt theo nguyên timestamp từng cue; OCR chỉ phục vụ tìm vùng blur. Nhịp TTS được fit về thời lượng câu gốc trong khoảng tự nhiên 0,90–1,15×. Khi xuất video, một lớp giọng gốc nhỏ được giữ dưới giọng Việt để video vẫn có cảm giác người trong cảnh đang nói.
+
+Với voice clone, OmniVoice được tạo ở 32 bước và nhận trực tiếp thời lượng cue gốc. Sau khi tạo, Whisper kiểm tra phần cuối từng clip giọng và cắt có fade nếu model sinh một cụm từ lặp không có trong câu, chẳng hạn “sao, sao”. Cache TTS cũ sẽ tự bị loại khi thuật toán tạo giọng thay đổi.
+
+Extension kiểm tra đúng phiên bản backend khi nối lại Colab. Nếu notebook vẫn chạy backend cũ, extension tự làm mới notebook và tạo lại job thay vì tiếp tục phát preview/cache cũ.
 
 Chế độ **Chỉnh thủ công** là ngoại lệ có chủ ý: quy trình sẽ dừng sau phân tích để hiện một canvas, cho phép tạo nhiều khung blur màu hồng và đúng một khung subtitle màu xanh; sau đó cần bấm nút tạo video.
 

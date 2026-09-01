@@ -2,17 +2,17 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 
-function runDouyin(url, state = null) {
+function runDouyin(url, state = null, message = { type: "GET_CURRENT_DOUYIN_VIDEO" }, videos = []) {
   let listener;
   const context = {
     globalThis: {}, location: { href: url }, history: { state }, innerWidth: 1920, innerHeight: 1080,
-    document: { querySelectorAll: () => [], documentElement: { innerHTML: "" }, body: {} },
+    document: { querySelectorAll: (selector) => selector === "video" ? videos : [], documentElement: { innerHTML: "" }, body: {} },
     chrome: { runtime: { onMessage: { addListener: (value) => { listener = value; } } } },
   };
   context.globalThis = context;
   vm.runInNewContext(fs.readFileSync("extension/content/douyin.js", "utf8"), context);
   let response;
-  listener({ type: "GET_CURRENT_DOUYIN_VIDEO" }, {}, (value) => { response = value; });
+  listener(message, {}, (value) => { response = value; });
   return response;
 }
 
@@ -28,6 +28,17 @@ assert.equal(
   runDouyin("https://www.douyin.com/discover", { aweme_id: "7674912144722875109" }).canonicalUrl,
   "https://www.douyin.com/video/7674912144722875109",
 );
+let sourcePaused = false;
+const sourceVideo = { paused: false, pause: () => { sourcePaused = true; sourceVideo.paused = true; } };
+assert.equal(
+  runDouyin(
+    "https://www.douyin.com/video/7662726211088534827", null,
+    { type: "PAUSE_DOUYIN_VIDEO", canonicalUrl: "https://www.douyin.com/video/7662726211088534827" },
+    [sourceVideo],
+  ).paused,
+  1,
+);
+assert.equal(sourcePaused, true);
 
 function runColabWithShadowOutput(output) {
   const messages = [];
@@ -82,11 +93,11 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   let injectionCount = 0;
   let messageCount = 0;
   let healthOk = true;
-  let refreshedUrl = "";
+  let tabUpdateOptions = null;
   let tabUpdatedListener;
   const event = () => ({ addListener: () => {} });
   const context = {
-    fetch: async () => ({ ok: healthOk }),
+    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.4.4" }) }),
     AbortSignal: { timeout: () => ({}) },
     setTimeout: (callback) => { callback(); return 1; },
     chrome: {
@@ -104,8 +115,8 @@ async function testServiceWorkerReinjectsExistingColabTab() {
         onUpdated: { addListener: (value) => { tabUpdatedListener = value; } }, onRemoved: event(),
         query: async () => [{ id: 7, windowId: 3, url: "https://colab.research.google.com/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb" }],
         update: async (_tabId, options) => {
-          refreshedUrl = options.url || "";
-          return { id: 7, windowId: 3, status: "loading", url: refreshedUrl };
+          tabUpdateOptions = options;
+          return { id: 7, windowId: 3, status: "complete", url: "https://colab.research.google.com/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb" };
         },
         create: async () => ({ id: 8 }),
         sendMessage: async () => {
@@ -125,11 +136,8 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   });
   assert.equal(response.ok, true);
   assert.equal(response.reused, true);
-  assert.equal(refreshedUrl, "https://colab.research.google.com/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb");
-  assert.equal(injectionCount, 0);
-  assert.equal(messageCount, 0);
-  tabUpdatedListener(7, { status: "complete" }, { url: refreshedUrl });
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(tabUpdateOptions.active, true);
+  assert.equal(Object.hasOwn(tabUpdateOptions, "url"), false);
   assert.equal(injectionCount, 1);
   assert.equal(messageCount, 2);
 
@@ -161,6 +169,7 @@ testServiceWorkerReinjectsExistingColabTab()
     assert.match(sidepanel, /isManualEditorPage/);
     assert.match(sidepanel, /existing\.jobId === state\.jobId/);
     assert.match(sidepanel, /\{ active: true, url \}/);
+    assert.match(fs.readFileSync("extension\/service-worker.js", "utf8"), /tabs\.update\(existing\.id, \{ active: true \}\)/);
     assert.match(styles, /body\.manual-editor-page #canvas-wrap/);
     assert.match(html, /id="toggle-preview"/);
     assert.match(html, /id="preview-seek"/);
@@ -178,6 +187,13 @@ testServiceWorkerReinjectsExistingColabTab()
     assert.match(sidepanel, /if \(!previewOnly \|\| !state\.immutableReviews\) \$\("#review-video"\)\.pause\(\)/);
     assert.match(sidepanel, /sidepanel\.html\?reviewPlayer=1/);
     assert.match(sidepanel, /reviewPlayerTab/);
+    assert.match(sidepanel, /new BroadcastChannel\("douyin-dubbing-review-playback"\)/);
+    assert.match(sidepanel, /health\.apiVersion !== EXPECTED_API_VERSION/);
+    assert.match(fs.readFileSync("extension\/content\/colab.js", "utf8"), /newestHandshake === rejectedHandshake/);
+    assert.match(sidepanel, /type: "PAUSE_DOUYIN_VIDEO"/);
+    assert.match(sidepanel, /reviewHandoff: handoff/);
+    assert.match(sidepanel, /state\.reviewResume = reviewVideo\.hidden/);
+    assert.match(sidepanel, /video\.currentTime = Math\.min\(Math\.max\(0, resume\.currentTime\)/);
     assert.match(sidepanel, /renderConfig/);
     assert.match(styles, /body\.review-player-page #review-video/);
     assert.match(styles, /height: calc\(100vh - 230px\)/);

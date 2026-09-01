@@ -48,9 +48,26 @@ function currentDouyinVideo() {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== "GET_CURRENT_DOUYIN_VIDEO") return false;
-  const result = currentDouyinVideo();
-  sendResponse(result ? { ok: true, ...result } : { ok: false, error: "Không tìm thấy video Douyin đang hiển thị." });
+  if (message?.type === "GET_CURRENT_DOUYIN_VIDEO") {
+    const result = currentDouyinVideo();
+    sendResponse(result ? { ok: true, ...result } : { ok: false, error: "Không tìm thấy video Douyin đang hiển thị." });
+    return false;
+  }
+  if (message?.type === "PAUSE_DOUYIN_VIDEO") {
+    const result = currentDouyinVideo();
+    if (message.canonicalUrl && result?.canonicalUrl !== message.canonicalUrl) {
+      sendResponse({ ok: true, paused: 0 });
+      return false;
+    }
+    let paused = 0;
+    for (const video of document.querySelectorAll("video")) {
+      if (video.paused) continue;
+      video.pause();
+      paused += 1;
+    }
+    sendResponse({ ok: true, paused });
+    return false;
+  }
   return false;
 });
 }

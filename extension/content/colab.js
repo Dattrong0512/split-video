@@ -6,6 +6,7 @@ if (location.href.includes("/github/Dattrong0512/split-video/blob/main/OmniVoice
   const ERROR_PATTERN = /(GPU_UNAVAILABLE|TUNNEL_FAILED|API_FAILED|INSTALL_FAILED):?\s*([^\n]*)/g;
   const OUTPUT_SELECTOR = "colab-output, colab-static-output-renderer, colab-stream-output, .output_text, .stream, [role=status]";
   let lastHandshake = "";
+  let rejectedHandshake = "";
   let lastProgress = "";
   let lastError = "";
   let runAllRequested = false;
@@ -73,8 +74,10 @@ if (location.href.includes("/github/Dattrong0512/split-video/blob/main/OmniVoice
     while ((match = PROGRESS_PATTERN.exec(text))) newestProgress = match[1];
     if (newestProgress) {
       try {
-        lastNotebookProgressAt = Date.now();
-        sendProgress(JSON.parse(newestProgress));
+        const payload = JSON.parse(newestProgress);
+        const serialized = JSON.stringify(payload);
+        if (serialized !== lastProgress) lastNotebookProgressAt = Date.now();
+        sendProgress(payload);
       } catch (_) {}
     }
 
@@ -89,7 +92,7 @@ if (location.href.includes("/github/Dattrong0512/split-video/blob/main/OmniVoice
     let newestHandshake = null;
     READY_PATTERN.lastIndex = 0;
     while ((match = READY_PATTERN.exec(text))) newestHandshake = match[1];
-    if (!newestHandshake || newestHandshake === lastHandshake) return;
+    if (!newestHandshake || newestHandshake === lastHandshake || newestHandshake === rejectedHandshake) return;
     try {
       const payload = JSON.parse(newestHandshake);
       if (/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/i.test(payload.url || "") && payload.token) {
@@ -97,6 +100,7 @@ if (location.href.includes("/github/Dattrong0512/split-video/blob/main/OmniVoice
         document.getElementById("neko-colab-helper")?.remove();
         chrome.runtime.sendMessage({ type: "COLAB_READY", payload }).then((response) => {
           if (!response?.stale || lastHandshake !== newestHandshake) return;
+          rejectedHandshake = newestHandshake;
           lastHandshake = "";
           forceRunPending = true;
           sendProgress({ stage: "restart", progress: 12, message: "Kết nối cũ đã hết hạn. Đang tạo máy chủ mới…" });
@@ -159,6 +163,9 @@ if (location.href.includes("/github/Dattrong0512/split-video/blob/main/OmniVoice
       }
       return;
     }
+    if (lastNotebookProgressAt && Date.now() - lastNotebookProgressAt < 20 * 60 * 1000) {
+      return;
+    }
     if (runAllRequested && lastNotebookProgressAt >= lastRunAllAt - 2000) {
       return;
     }
@@ -192,6 +199,7 @@ if (location.href.includes("/github/Dattrong0512/split-video/blob/main/OmniVoice
   function resetAutomation(force = false) {
     if (force) {
       lastHandshake = "";
+      rejectedHandshake = "";
       lastProgress = "";
       lastError = "";
       runAllRequested = false;
@@ -218,6 +226,14 @@ if (location.href.includes("/github/Dattrong0512/split-video/blob/main/OmniVoice
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type !== "START_COLAB_AUTOMATION") return false;
+    if (message.rescan) {
+      lastHandshake = "";
+      rejectedHandshake = "";
+      lastProgress = "";
+      lastError = "";
+      lastNotebookProgressAt = 0;
+      rootsExpireAt = 0;
+    }
     resetAutomation(Boolean(message.force));
     sendResponse({ ok: true });
     return false;

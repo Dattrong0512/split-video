@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,7 @@ class PipelineError(RuntimeError):
 _whisper_model = None
 _omnivoice_model = None
 _ocr_model = None
+TTS_CACHE_VERSION = 3
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
@@ -494,6 +497,78 @@ def _atempo(speed: float) -> str:
     return ",".join(parts)
 
 
+def _spoken_tokens(value: str) -> list[str]:
+    value = unicodedata.normalize("NFD", str(value).lower())
+    value = "".join(character for character in value if unicodedata.category(character) != "Mn")
+    return re.findall(r"[^\W_]+", value, flags=re.UNICODE)
+
+
+def repeated_tts_tail_cutoff(text: str, words: list) -> float | None:
+    recognized = []
+    for word in words:
+        tokens = _spoken_tokens(getattr(word, "word", ""))
+        if not tokens:
+            continue
+        recognized.append({
+            "token": tokens[-1], "start": float(word.start), "end": float(word.end),
+        })
+    if len(recognized) < 2:
+        return None
+    tail_token = recognized[-1]["token"]
+    run_start = len(recognized) - 1
+    while run_start > 0 and recognized[run_start - 1]["token"] == tail_token:
+        run_start -= 1
+    run_length = len(recognized) - run_start
+    if run_length < 2:
+        return None
+
+    expected = _spoken_tokens(text)
+    expected_suffix = 0
+    for token in reversed(expected):
+        if token != tail_token:
+            break
+        expected_suffix += 1
+    if run_length <= expected_suffix:
+        return None
+
+    expected_prefix = expected[:-expected_suffix] if expected_suffix else expected
+    recognized_prefix = [item["token"] for item in recognized[:run_start]]
+    if expected_prefix:
+        matching = sum(
+            block.size for block in difflib.SequenceMatcher(None, expected_prefix, recognized_prefix).get_matching_blocks()
+        )
+        if matching / len(expected_prefix) < .55:
+            return None
+
+    if expected_suffix:
+        last_kept = recognized[run_start + min(expected_suffix, run_length) - 1]
+        return last_kept["end"] + .06
+    return max(.05, recognized[run_start]["start"] - .03)
+
+
+def trim_repeated_tts_tail(path: Path, text: str) -> bool:
+    try:
+        segments, _ = _whisper().transcribe(
+            str(path), language="vi", vad_filter=True, beam_size=1,
+            word_timestamps=True, condition_on_previous_text=False,
+        )
+        words = [word for segment in segments for word in (segment.words or [])]
+        cutoff = repeated_tts_tail_cutoff(text, words)
+        if cutoff is None or cutoff >= media_duration(path) - .04:
+            return False
+        cleaned = path.with_name(f"{path.stem}-clean.wav")
+        fade_start = max(0, cutoff - .05)
+        run([
+            ffmpeg(), "-y", "-i", str(path), "-af",
+            f"atrim=0:{cutoff:.3f},afade=t=out:st={fade_start:.3f}:d=.05",
+            "-ar", "24000", "-ac", "1", str(cleaned),
+        ], "VOICE_FAILED")
+        cleaned.replace(path)
+        return True
+    except Exception:
+        return False
+
+
 def plan_dubbing_timeline(
     cues: list[dict], generated_durations: list[float], video_duration: float,
     gap: float = .04, speech_rate: float = 1.0,
@@ -535,7 +610,9 @@ def _omnivoice():
     return _omnivoice_model
 
 
-def synthesize_cue(text: str, voice: str, raw: Path, voices: dict) -> None:
+def synthesize_cue(
+    text: str, voice: str, raw: Path, voices: dict, target_duration: float | None = None,
+) -> None:
     if voice.startswith("edge:"):
         import edge_tts
         asyncio.run(edge_tts.Communicate(text, voice=voice[5:]).save(str(raw.with_suffix(".mp3"))))
@@ -546,7 +623,13 @@ def synthesize_cue(text: str, voice: str, raw: Path, voices: dict) -> None:
     import soundfile as sf
     reference = voices[voice[6:]]
     model = _omnivoice()
-    audio = model.generate(text=text, language="vi", ref_audio=str(reference["path"]), ref_text=reference["transcript"], num_step=16)[0]
+    generation_options = {"num_step": 32, "postprocess_output": True}
+    if target_duration is not None:
+        generation_options["duration"] = max(.35, float(target_duration))
+    audio = model.generate(
+        text=text, language="vi", ref_audio=str(reference["path"]),
+        ref_text=reference["transcript"], **generation_options,
+    )[0]
     sf.write(str(raw), audio, model.sampling_rate)
 
 
@@ -564,10 +647,17 @@ def create_dubbing(job: dict, request, voices: dict, duration_limit: float | Non
         cache_key = str(cue["id"])
         cached = cache.get(cache_key, {})
         raw = directory / f"raw-{int(cue['id']):04d}.wav"
-        if cached.get("voice") != voice or cached.get("text") != cue["text_vi"] or not raw.exists():
+        if (cached.get("version") != TTS_CACHE_VERSION or cached.get("voice") != voice
+                or cached.get("text") != cue["text_vi"] or not raw.exists()):
             update(job, 62 + index / max(1, total) * 12, f"Đang tạo giọng Việt {index}/{total} ({cue['speaker']})…")
-            synthesize_cue(cue["text_vi"], voice, raw, voices)
-            cache[cache_key] = {"voice": voice, "text": cue["text_vi"], "duration": media_duration(raw)}
+            cue_duration = max(.35, float(cue["end"]) - float(cue["start"]))
+            synthesize_cue(cue["text_vi"], voice, raw, voices, target_duration=cue_duration)
+            if voice.startswith("clone:"):
+                trim_repeated_tts_tail(raw, cue["text_vi"])
+            cache[cache_key] = {
+                "version": TTS_CACHE_VERSION, "voice": voice,
+                "text": cue["text_vi"], "duration": media_duration(raw),
+            }
         generated_files.append(raw)
         generated_durations.append(float(cache[cache_key]["duration"]))
     output_duration = min(float(job["duration"]), duration_limit) if duration_limit is not None else float(job["duration"])

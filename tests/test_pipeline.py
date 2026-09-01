@@ -7,11 +7,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from backend.pipeline import (
-    DEFAULT_GEMINI_MODEL, PipelineError, _apply_translation_rows, _atempo, _gemini_retry_options,
+    DEFAULT_GEMINI_MODEL, TTS_CACHE_VERSION, PipelineError, _apply_translation_rows, _atempo, _gemini_retry_options,
     _old_ocr_rows, _screen_subtitle_text, _translation_cue_payload, _translation_prompt, _translation_schema,
     _v3_ocr_boxes, _v3_ocr_rows, audio_mix_filter, cluster_rectangles, encoding_options, media_duration,
     ensure_portrait_subtitle_blur, original_bed_filter, plan_dubbing_timeline, transcribe,
-    render_job, video_filter, write_ass,
+    render_job, repeated_tts_tail_cutoff, synthesize_cue, video_filter, write_ass,
 )
 
 
@@ -189,6 +189,44 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(faster["speed"], 1.32)
         self.assertLess(faster["end"], normal["end"])
 
+    def test_clone_synthesis_uses_cue_duration_and_full_quality_steps(self):
+        model = SimpleNamespace(
+            sampling_rate=24000,
+            generate=MagicMock(return_value=[[0.0, 0.0]]),
+        )
+        voices = {"voice-id": {
+            "path": Path("reference.wav"), "transcript": "Đây là giọng tham chiếu.",
+        }}
+        with patch("backend.pipeline._omnivoice", return_value=model), patch("soundfile.write") as write:
+            synthesize_cue(
+                "Đây là câu cần nói.", "clone:voice-id", Path("raw.wav"), voices,
+                target_duration=1.7,
+            )
+        options = model.generate.call_args.kwargs
+        self.assertEqual(options["duration"], 1.7)
+        self.assertEqual(options["num_step"], 32)
+        self.assertTrue(options["postprocess_output"])
+        write.assert_called_once()
+
+    def test_repeated_unwritten_tts_tail_is_cut_after_expected_sentence(self):
+        words = [
+            SimpleNamespace(word="Tôi", start=0, end=.2),
+            SimpleNamespace(word="không", start=.22, end=.45),
+            SimpleNamespace(word="biết", start=.47, end=.7),
+            SimpleNamespace(word="tại", start=.72, end=.9),
+            SimpleNamespace(word="sao", start=.92, end=1.1),
+            SimpleNamespace(word="sao", start=1.13, end=1.3),
+            SimpleNamespace(word="sao", start=1.33, end=1.5),
+        ]
+        self.assertAlmostEqual(repeated_tts_tail_cutoff("Tôi không biết tại sao.", words), 1.16)
+
+    def test_legitimate_non_repeated_sentence_ending_is_not_cut(self):
+        words = [
+            SimpleNamespace(word="Tại", start=0, end=.2),
+            SimpleNamespace(word="sao", start=.22, end=.45),
+        ]
+        self.assertIsNone(repeated_tts_tail_cutoff("Tại sao?", words))
+
     def test_overflowing_cues_compact_into_pauses_before_video_end(self):
         cues = [{"start": 1, "end": 2}, {"start": 4, "end": 4.5}]
         timeline = plan_dubbing_timeline(cues, [2, 2], 5)
@@ -241,7 +279,10 @@ class PipelineHelpersTest(unittest.TestCase):
                 "-f", "lavfi", "-i", "sine=frequency=330:duration=2", str(background),
             ], check=True)
 
-            def fake_synthesize(_text, _voice, raw, _voices):
+            generated_targets = []
+
+            def fake_synthesize(_text, _voice, raw, _voices, target_duration=None):
+                generated_targets.append(target_duration)
                 subprocess.run([
                     shutil.which("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
                     "-f", "lavfi", "-i", "sine=frequency=660:duration=1", "-ar", "24000", "-ac", "1", str(raw),
@@ -273,6 +314,8 @@ class PipelineHelpersTest(unittest.TestCase):
             self.assertEqual(job["status"], "complete")
             self.assertTrue(job["result"].exists())
             self.assertEqual(synthesize.call_count, 1)
+            self.assertEqual(generated_targets, [1.0])
+            self.assertEqual(job["tts_cache"]["0"]["version"], TTS_CACHE_VERSION)
 
 
 if __name__ == "__main__":

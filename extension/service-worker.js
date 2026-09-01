@@ -1,5 +1,6 @@
 const NOTEBOOK_URL = "https://colab.research.google.com/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb";
 const NOTEBOOK_PATH = "/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb";
+const EXPECTED_API_VERSION = "1.4.4";
 let openingColab = null;
 const pendingColabTabs = new Set();
 const activeDownloads = new Set();
@@ -11,7 +12,7 @@ async function serverSessionIsAlive(session) {
         headers: { Authorization: `Bearer ${session.token}` },
         signal: AbortSignal.timeout(5000),
       });
-      if (response.ok) return true;
+      if (response.ok && (await response.json()).apiVersion === EXPECTED_API_VERSION) return true;
     } catch (_) {}
     if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 600));
   }
@@ -24,13 +25,13 @@ async function protectPrivateStorage() {
 
 async function startColabAutomation(tabId, force = true) {
   try {
-    await chrome.tabs.sendMessage(tabId, { type: "START_COLAB_AUTOMATION", force });
+    await chrome.tabs.sendMessage(tabId, { type: "START_COLAB_AUTOMATION", force, rescan: true });
     return;
   } catch (_) {
     // Reloading an unpacked extension does not inject it into tabs that were already open.
   }
   await chrome.scripting.executeScript({ target: { tabId }, files: ["content/colab.js"] });
-  await chrome.tabs.sendMessage(tabId, { type: "START_COLAB_AUTOMATION", force });
+  await chrome.tabs.sendMessage(tabId, { type: "START_COLAB_AUTOMATION", force, rescan: true });
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -91,10 +92,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const tabs = await chrome.tabs.query({ url: "https://colab.research.google.com/*" });
         const existing = tabs.find((tab) => (tab.url || "").includes(NOTEBOOK_PATH));
         if (existing?.id) {
-          const refreshed = await chrome.tabs.update(existing.id, { active: true, url: NOTEBOOK_URL });
+          await chrome.tabs.update(existing.id, { active: true });
           if (existing.windowId) await chrome.windows.update(existing.windowId, { focused: true });
-          if (refreshed?.status === "complete") startColabAutomation(existing.id, false).catch(() => {});
-          else pendingColabTabs.add(existing.id);
+          await startColabAutomation(existing.id, false);
           return { ok: true, tabId: existing.id, reused: true };
         }
         const tab = await chrome.tabs.create({ url: NOTEBOOK_URL, active: true });

@@ -2,9 +2,12 @@ import { CanvasEditor } from "./canvas-editor.js";
 import { cookieSummary, deleteClone, listClones, saveClone } from "./storage.js";
 
 const $ = (selector) => document.querySelector(selector);
+const EXPECTED_API_VERSION = "1.4.4";
 const pageParams = new URLSearchParams(location.search);
 const isManualEditorPage = pageParams.get("manualEditor") === "1";
 const isReviewPlayerPage = pageParams.get("reviewPlayer") === "1";
+const pageInstanceId = crypto.randomUUID();
+const reviewChannel = new BroadcastChannel("douyin-dubbing-review-playback");
 if (isManualEditorPage) document.body.classList.add("manual-editor-page");
 if (isReviewPlayerPage) document.body.classList.add("review-player-page");
 const editor = new CanvasEditor($("#preview-canvas"));
@@ -12,7 +15,37 @@ const state = {
   canonicalUrl: "", server: null, jobId: null, stage: "idle", blurMode: "auto",
   clones: [], voices: [], analysis: null, pending: null, pollTimer: null, recoveryCount: 0, downloadId: null,
   speechRate: 1, previewRate: null, immutableReviews: false, renderConfig: null, uploadedClones: {},
+  reviewResume: null,
 };
+
+function reviewSnapshot(shouldPlay = null) {
+  const video = $("#review-video");
+  return {
+    jobId: state.jobId,
+    currentTime: Number.isFinite(video.currentTime) ? video.currentTime : 0,
+    shouldPlay: shouldPlay ?? (!video.paused && !video.ended),
+    speechRate: state.speechRate,
+    createdAt: Date.now(),
+  };
+}
+
+async function pauseSourceVideo() {
+  const tabs = await chrome.tabs.query({ url: ["https://*.douyin.com/*"] });
+  await Promise.allSettled(tabs.map((tab) => chrome.tabs.sendMessage(tab.id, {
+    type: "PAUSE_DOUYIN_VIDEO", canonicalUrl: state.canonicalUrl,
+  })));
+}
+
+function pauseOtherReviewPlayers() {
+  reviewChannel.postMessage({ type: "claim", sender: pageInstanceId, jobId: state.jobId });
+  pauseSourceVideo().catch(() => {});
+}
+
+reviewChannel.addEventListener("message", (event) => {
+  const message = event.data;
+  if (message?.type !== "claim" || message.sender === pageInstanceId || message.jobId !== state.jobId) return;
+  $("#review-video").pause();
+});
 
 function setStatus(message, progress = null) {
   $("#status").textContent = message;
@@ -56,6 +89,10 @@ function showSpeedCard() {
 async function showDubbingReview() {
   const review = await serverFetch(`/api/jobs/${state.jobId}/review-token`, { method: "POST" });
   const video = $("#review-video");
+  const resume = state.reviewResume ? { ...state.reviewResume } : null;
+  if (resume?.shouldPlay && !video.hidden && Number.isFinite(video.currentTime)) {
+    resume.currentTime = video.currentTime;
+  }
   video.defaultPlaybackRate = 1;
   video.playbackRate = 1;
   video.preservesPitch = true;
@@ -63,15 +100,26 @@ async function showDubbingReview() {
   video.hidden = false;
   $("#open-large-review").hidden = false;
   video.load();
+  await new Promise((resolve) => {
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) resolve();
+    else video.addEventListener("loadedmetadata", resolve, { once: true });
+  });
+  if (resume && Number.isFinite(resume.currentTime)) {
+    video.currentTime = Math.min(Math.max(0, resume.currentTime), Math.max(0, video.duration - .05));
+  }
   state.previewRate = Number(review.speechRate);
   state.speechRate = state.previewRate;
+  state.reviewResume = null;
   state.stage = "preview_ready";
   showSpeedCard();
   setBusy(false);
   setStatus(`Đã tạo preview ${review.seconds.toFixed(0)} giây ở tốc độ ${state.previewRate.toFixed(2)}×. Hãy nghe thử.`, 100);
   $("#primary").textContent = "Dùng tốc độ này & tải toàn bộ";
   await persistJob();
-  video.play().catch(() => {});
+  if (resume?.shouldPlay) {
+    pauseOtherReviewPlayers();
+    video.play().catch(() => {});
+  }
 }
 
 function invalidateDubbingReview() {
@@ -101,6 +149,7 @@ function auditionSpeechRate() {
   video.playbackRate = liveRate;
   video.preservesPitch = true;
   if (video.ended) video.currentTime = 0;
+  pauseOtherReviewPlayers();
   video.play().catch(() => {});
   if (Math.abs(state.speechRate - state.previewRate) <= .001) {
     state.stage = "preview_ready";
@@ -132,6 +181,7 @@ function friendlyError(error) {
     JOB_NOT_FOUND: "Runtime Colab đã khởi động lại nên job cũ không còn. Hãy chạy lại video.",
     NO_SPEECH: "Video không có lời thoại để lồng tiếng.",
     GEMINI_RESPONSE_INVALID: "Gemini trả kết quả không hợp lệ. Hãy thử lại.",
+    STALE_RUNTIME: "Colab đang chạy backend cũ. Extension đang khởi động lại phiên mới…",
   };
   return messages[errorCode(error)] || error?.message || error?.detail?.message || String(error || "Có lỗi xảy ra.");
 }
@@ -160,6 +210,7 @@ async function checkServer(retries = 2) {
     state.server = candidate;
     try {
       const health = await serverFetch("/api/health", { signal: AbortSignal.timeout(8000) });
+      if (health.apiVersion !== EXPECTED_API_VERSION) throw { code: "STALE_RUNTIME" };
       state.immutableReviews = Boolean(health.immutableReviews);
       return health;
     }
@@ -257,6 +308,10 @@ async function openManualEditor() {
 }
 
 async function openReviewPlayer() {
+  const handoff = reviewSnapshot();
+  state.reviewResume = handoff;
+  await chrome.storage.session.set({ reviewHandoff: handoff });
+  $("#review-video").pause();
   await persistJob();
   const url = chrome.runtime.getURL("sidepanel.html?reviewPlayer=1");
   const stored = await chrome.storage.session.get("reviewPlayerTab");
@@ -286,9 +341,24 @@ async function ensureServer(action) {
       state.voices = health.voices || [];
       rebuildVoices();
       return true;
-    } catch (_) {
+    } catch (error) {
       state.server = null;
       await chrome.storage.session.remove(["serverSession", "colabProgress"]);
+      if (errorCode(error) === "STALE_RUNTIME" && state.canonicalUrl) {
+        state.jobId = null;
+        state.stage = "idle";
+        state.analysis = null;
+        state.previewRate = null;
+        state.renderConfig = null;
+        await chrome.storage.session.remove("activeJob");
+        setBusy(true);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.4.4 và tạo lại preview sạch…", 2);
+        ensureServer("analyze").catch((restartError) => {
+          setBusy(false);
+          setStatus(friendlyError(restartError));
+        });
+        return;
+      }
     }
   }
   await storePending(action);
@@ -439,6 +509,13 @@ async function render(previewOnly) {
     return;
   }
   $("#preview-video").pause();
+  if (previewOnly) {
+    const reviewVideo = $("#review-video");
+    state.reviewResume = reviewVideo.hidden ? {
+      jobId: state.jobId, currentTime: 0, shouldPlay: true,
+      speechRate: state.speechRate, createdAt: Date.now(),
+    } : reviewSnapshot();
+  }
   if (!previewOnly || !state.immutableReviews) $("#review-video").pause();
   setBusy(true);
   setStatus(previewOnly ? "Đang tạo bản nghe thử 30 giây…" : "Đang xuất toàn bộ video với tốc độ đã chọn…", 58);
@@ -529,7 +606,7 @@ async function initialize() {
   }
   const [saved, session] = await Promise.all([
     chrome.storage.local.get(["geminiKey", "douyinCookies", "preferredVoice"]),
-    chrome.storage.session.get(["serverSession", "pendingAction", "activeJob", "colabProgress"]),
+    chrome.storage.session.get(["serverSession", "pendingAction", "activeJob", "colabProgress", "reviewHandoff"]),
   ]);
   $("#gemini-key").value = saved.geminiKey || "";
   $("#cookie-status").textContent = saved.douyinCookies ? cookieSummary(saved.douyinCookies).label : "Chưa có cookie.";
@@ -557,6 +634,7 @@ async function initialize() {
   } else if (isReviewPlayerPage) {
     const currentTab = await chrome.tabs.getCurrent();
     if (currentTab?.id) await chrome.storage.session.set({ reviewPlayerTab: { tabId: currentTab.id, jobId: state.jobId } });
+    if (session.reviewHandoff?.jobId === state.jobId) state.reviewResume = session.reviewHandoff;
   }
   await findCurrentVideo(Boolean(state.canonicalUrl));
 
@@ -568,9 +646,24 @@ async function initialize() {
       rebuildVoices(saved.preferredVoice);
       if (state.jobId) { setBusy(true); pollJob(); return; }
       if (state.pending) { resumePending(); return; }
-    } catch (_) {
+    } catch (error) {
       state.server = null;
       await chrome.storage.session.remove(["serverSession", "colabProgress"]);
+      if (errorCode(error) === "STALE_RUNTIME" && state.canonicalUrl) {
+        state.jobId = null;
+        state.stage = "idle";
+        state.analysis = null;
+        state.previewRate = null;
+        state.renderConfig = null;
+        await chrome.storage.session.remove("activeJob");
+        setBusy(true);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.4.4 và tạo lại preview sạch…", 2);
+        ensureServer("analyze").catch((restartError) => {
+          setBusy(false);
+          setStatus(friendlyError(restartError));
+        });
+        return;
+      }
     }
   }
   if (state.pending) {
@@ -601,6 +694,18 @@ $("#default-voice").addEventListener("change", () => {
   invalidateDubbingReview();
 });
 $("#open-large-review").addEventListener("click", openReviewPlayer);
+$("#review-video").addEventListener("play", pauseOtherReviewPlayers);
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  const handoff = changes.reviewHandoff?.newValue;
+  if (areaName !== "session" || !isReviewPlayerPage || handoff?.jobId !== state.jobId) return;
+  state.reviewResume = handoff;
+  state.speechRate = Number(handoff.speechRate || state.speechRate);
+  showSpeedCard();
+  const video = $("#review-video");
+  if (video.hidden || !Number.isFinite(handoff.currentTime)) return;
+  video.currentTime = Math.min(Math.max(0, handoff.currentTime), Math.max(0, video.duration - .05));
+  if (handoff.shouldPlay) video.play().catch(() => {});
+});
 $("#primary").addEventListener("click", async () => {
   if (state.stage === "ready") {
     if (state.blurMode === "manual" && !isManualEditorPage && !isReviewPlayerPage) return openManualEditor();
