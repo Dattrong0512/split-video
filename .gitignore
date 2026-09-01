@@ -12,6 +12,7 @@ downloads/
 subtitle_jobs/
 render_jobs/
 *.json
+!extension/manifest.json
 cookies*.txt
 cookie*.txt
 

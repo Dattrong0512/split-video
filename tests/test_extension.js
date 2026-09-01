@@ -109,5 +109,15 @@ async function testServiceWorkerReinjectsExistingColabTab() {
 }
 
 testServiceWorkerReinjectsExistingColabTab()
-  .then(() => console.log("Extension automation tests passed."))
+  .then(() => {
+    const sidepanel = fs.readFileSync("extension/sidepanel.js", "utf8");
+    const styles = fs.readFileSync("extension/sidepanel.css", "utf8");
+    assert.match(sidepanel, /sidepanel\.html\?manualEditor=1/);
+    assert.match(sidepanel, /chrome\.tabs\.create\(\{ url, active: true \}\)/);
+    assert.match(sidepanel, /isManualEditorPage/);
+    assert.match(sidepanel, /existing\.jobId === state\.jobId/);
+    assert.match(sidepanel, /\{ active: true, url \}/);
+    assert.match(styles, /body\.manual-editor-page #canvas-wrap/);
+    console.log("Extension automation tests passed.");
+  })
   .catch((error) => { console.error(error); process.exitCode = 1; });

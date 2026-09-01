@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Douyin Vietnamese Dubbing",
+  "version": "1.2.0",
+  "description": "Tải video Douyin đang xem, làm mờ chữ gốc, tạo phụ đề và lồng tiếng Việt.",
+  "minimum_chrome_version": "116",
+  "permissions": ["scripting", "storage", "downloads", "sidePanel"],
+  "host_permissions": [
+    "https://*.douyin.com/*",
+    "https://colab.research.google.com/*",
+    "https://*.trycloudflare.com/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Douyin Vietnamese Dubbing"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.douyin.com/*"],
+      "js": ["content/douyin.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://colab.research.google.com/*"],
+      "js": ["content/colab.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

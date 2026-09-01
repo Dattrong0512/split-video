@@ -2,6 +2,8 @@ import { CanvasEditor } from "./canvas-editor.js";
 import { cookieSummary, deleteClone, listClones, saveClone } from "./storage.js";
 
 const $ = (selector) => document.querySelector(selector);
+const isManualEditorPage = new URLSearchParams(location.search).get("manualEditor") === "1";
+if (isManualEditorPage) document.body.classList.add("manual-editor-page");
 const editor = new CanvasEditor($("#preview-canvas"));
 const state = {
   canonicalUrl: "", server: null, jobId: null, stage: "idle", blurMode: "auto",
@@ -132,6 +134,26 @@ async function persistJob() {
   } });
 }
 
+async function openManualEditor() {
+  const url = chrome.runtime.getURL("sidepanel.html?manualEditor=1");
+  const stored = await chrome.storage.session.get("manualEditorTab");
+  const existing = stored.manualEditorTab;
+  if (existing?.tabId) {
+    try {
+      const update = existing.jobId === state.jobId ? { active: true } : { active: true, url };
+      const tab = await chrome.tabs.update(existing.tabId, update);
+      if (tab.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
+      await chrome.storage.session.set({ manualEditorTab: { tabId: tab.id, jobId: state.jobId } });
+      return tab;
+    } catch (_) {
+      await chrome.storage.session.remove("manualEditorTab");
+    }
+  }
+  const tab = await chrome.tabs.create({ url, active: true });
+  await chrome.storage.session.set({ manualEditorTab: { tabId: tab.id, jobId: state.jobId } });
+  return tab;
+}
+
 async function ensureServer(action) {
   const stored = await chrome.storage.session.get(["serverSession", "colabProgress"]);
   state.server = state.server || stored.serverSession || null;
@@ -210,6 +232,13 @@ async function applyAnalysis(analysis) {
   if (state.blurMode === "auto") {
     setStatus("Đã phân tích. Đang tự lồng tiếng và xuất video…", 56);
     return render();
+  }
+  if (!isManualEditorPage) {
+    await openManualEditor();
+    setBusy(false);
+    setStatus("Đã mở trình chỉnh khung trong một tab mới.", 55);
+    $("#primary").textContent = "Mở lại tab chỉnh khung";
+    return;
   }
   await editor.setImage(analysis.previewDataUrl);
   editor.setRegions(analysis.blurRegions, analysis.subtitleRect);
@@ -331,6 +360,9 @@ async function resumePending() {
 }
 
 async function initialize() {
+  if (isManualEditorPage) {
+    $("header h1").textContent = "Chỉnh blur & subtitle";
+  }
   const [saved, session] = await Promise.all([
     chrome.storage.local.get(["geminiKey", "douyinCookies", "preferredVoice"]),
     chrome.storage.session.get(["serverSession", "pendingAction", "activeJob", "colabProgress"]),
@@ -350,6 +382,10 @@ async function initialize() {
     state.recoveryCount = session.activeJob?.recoveryCount || 0;
     state.pending = session.pendingAction?.action || null;
     document.querySelectorAll("[data-blur-mode]").forEach((button) => button.classList.toggle("active", button.dataset.blurMode === state.blurMode));
+  }
+  if (isManualEditorPage) {
+    const currentTab = await chrome.tabs.getCurrent();
+    if (currentTab?.id) await chrome.storage.session.set({ manualEditorTab: { tabId: currentTab.id, jobId: state.jobId } });
   }
   await findCurrentVideo(Boolean(state.canonicalUrl));
 
@@ -390,7 +426,10 @@ $("#toggle-settings").addEventListener("click", () => { const body = $("#setting
 $("#refresh-video").addEventListener("click", () => findCurrentVideo());
 $("#default-voice").addEventListener("change", () => chrome.storage.local.set({ preferredVoice: $("#default-voice").value }));
 $("#primary").addEventListener("click", async () => {
-  if (state.stage === "ready") return render();
+  if (state.stage === "ready") {
+    if (state.blurMode === "manual" && !isManualEditorPage) return openManualEditor();
+    return render();
+  }
   if (state.stage === "complete") {
     state.stage = "idle";
     state.recoveryCount = 0;
