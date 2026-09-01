@@ -288,7 +288,7 @@ async function render() {
       if (voice.startsWith("clone:")) selections[speaker] = `clone:${uploaded[voice.slice(6)]}`;
     }
     const blurRegions = state.blurMode === "manual" ? editor.blurRegions : (state.analysis?.blurRegions || []);
-    const subtitleRect = state.blurMode === "manual" ? editor.subtitleRect : (state.analysis?.subtitleRect || { x: .08, y: .75, w: .84, h: .17 });
+    const subtitleRect = state.blurMode === "manual" ? editor.subtitleRect : (state.analysis?.subtitleRect || { x: .08, y: .78, w: .84, h: .16 });
     await serverFetch(`/api/jobs/${state.jobId}/render`, {
       method: "POST",
       body: JSON.stringify({ voiceMap: selections, blurRegions, subtitleRect }),

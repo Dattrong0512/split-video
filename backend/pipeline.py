@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,18 @@ class PipelineError(RuntimeError):
 
 _whisper_model = None
 _omnivoice_model = None
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
+
+
+def _gemini_retry_options() -> dict:
+    return {
+        "attempts": 6,
+        "initial_delay": 2.0,
+        "max_delay": 30.0,
+        "exp_base": 2.0,
+        "jitter": 1.0,
+        "http_status_codes": [408, 429, 500, 502, 503, 504],
+    }
 
 
 def update(job: dict, progress: float, message: str, **extra: Any) -> None:
@@ -51,6 +64,27 @@ def media_duration(path: Path) -> float:
     if not match:
         raise PipelineError("INVALID_MEDIA", "Không đọc được thời lượng media.")
     return int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3])
+
+
+def video_size(path: Path) -> tuple[int, int]:
+    probe = shutil.which("ffprobe")
+    if probe:
+        result = subprocess.run(
+            [probe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        try:
+            stream = json.loads(result.stdout)["streams"][0]
+            width, height = int(stream["width"]), int(stream["height"])
+            if width > 0 and height > 0:
+                return width, height
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    result = subprocess.run([ffmpeg(), "-hide_banner", "-i", str(path)], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    match = re.search(r"Video:.*?[, ](\d{2,5})x(\d{2,5})(?:[, \[])", result.stderr)
+    if not match:
+        raise PipelineError("INVALID_MEDIA", "Không đọc được kích thước video.")
+    return int(match[1]), int(match[2])
 
 
 def _whisper():
@@ -100,11 +134,56 @@ def extract_assets(source: Path, directory: Path, duration: float) -> tuple[Path
 
 
 def transcribe(audio: Path) -> list[dict]:
-    segments, _ = _whisper().transcribe(str(audio), vad_filter=True, beam_size=5, condition_on_previous_text=True)
+    segments, _ = _whisper().transcribe(
+        str(audio), language="zh", vad_filter=True, beam_size=5, condition_on_previous_text=True,
+    )
     cues = [{"id": index, "start": float(segment.start), "end": max(float(segment.end), float(segment.start) + .12), "original": segment.text.strip()}
             for index, segment in enumerate(segments) if segment.text and segment.text.strip()]
     if not cues:
         raise PipelineError("NO_SPEECH", "Không nhận diện được lời thoại trong video.")
+    return cues
+
+
+def _translation_schema(cue_count: int) -> dict:
+    return {
+        "type": "array", "minItems": cue_count, "maxItems": cue_count,
+        "items": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "id": {"type": "integer"},
+                "original_corrected": {"type": "string", "description": "Chinese transcript corrected from the audio"},
+                "text_vi": {"type": "string", "description": "Concise, faithful Vietnamese sentence that fits the cue duration"},
+                "speaker": {"type": "string"},
+                "gender": {"type": "string", "enum": ["male", "female", "unknown"]},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+            "required": ["id", "original_corrected", "text_vi", "speaker", "gender", "confidence"],
+        },
+    }
+
+
+def _apply_translation_rows(cues: list[dict], rows: Any) -> list[dict]:
+    if not isinstance(rows, list):
+        raise ValueError("Kết quả không phải JSON array")
+    by_id = {int(row["id"]): row for row in rows if isinstance(row, dict)}
+    expected_ids = {int(cue["id"]) for cue in cues}
+    if len(by_id) != len(rows) or set(by_id) != expected_ids:
+        raise ValueError("Gemini đã thay đổi danh sách id")
+    for cue in cues:
+        row = by_id[int(cue["id"])]
+        corrected = str(row["original_corrected"]).strip()
+        translated = str(row["text_vi"]).strip()
+        if not corrected or not translated:
+            raise ValueError("Transcript hoặc bản dịch trống")
+        cue["original_corrected"] = corrected
+        cue["text_vi"] = translated
+        cue["speaker"] = re.sub(r"[^A-Za-z0-9_-]", "", str(row.get("speaker", "S1")))[:20] or "S1"
+        gender = str(row.get("gender", "unknown")).lower()
+        cue["gender"] = gender if gender in {"male", "female", "unknown"} else "unknown"
+        confidence = float(row["confidence"])
+        if not 0 <= confidence <= 1:
+            raise ValueError("Độ tin cậy nằm ngoài khoảng 0–1")
+        cue["confidence"] = confidence
     return cues
 
 
@@ -114,18 +193,32 @@ def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
     try:
         from google import genai
         from google.genai import types
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=300_000,
+                retry_options=types.HttpRetryOptions(**_gemini_retry_options()),
+            ),
+        )
         uploaded = client.files.upload(file=str(audio))
         prompt = (
-            "Nghe audio và đối chiếu transcript. Sửa lỗi nhận dạng, dịch từng câu sang tiếng Việt tự nhiên, "
-            "gán người nói nhất quán S1, S2... và gender male/female/unknown. Không đổi, thiếu, thêm, gộp hoặc tách id. "
-            "Chỉ trả JSON array với các field id, text_vi, speaker, gender. Transcript: " +
-            json.dumps([{"id": cue["id"], "text": cue["original"]} for cue in cues], ensure_ascii=False)
+            "Chỉ dùng âm thanh đính kèm để sửa transcript tiếng Trung và dịch; không suy đoán từ hình ảnh, "
+            "không bịa hoặc thêm ý không có trong lời nói. Giữ nguyên từng id, không bỏ, thêm, gộp hay tách cue. "
+            "Bản dịch tiếng Việt phải đúng nghĩa, tự nhiên, viết hoa kiểu câu bình thường và đủ ngắn để đọc trong "
+            "duration_seconds; ưu tiên rút gọn mà không mất ý. Gán người nói nhất quán S1, S2... và chỉ suy đoán "
+            "giới tính khi nghe đủ rõ. Dữ liệu cue: " +
+            json.dumps([{
+                "id": cue["id"], "start_seconds": round(cue["start"], 3),
+                "end_seconds": round(cue["end"], 3), "duration_seconds": round(cue["end"] - cue["start"], 3),
+                "whisper_transcript": cue["original"],
+            } for cue in cues], ensure_ascii=False)
         )
         response = client.models.generate_content(
-            model=os.environ.get("GEMINI_MODEL", "gemini-3.7-flash"),
+            model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             contents=[prompt, uploaded],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json", response_json_schema=_translation_schema(len(cues)), temperature=.1,
+            ),
         )
         text = response.text or ""
     except Exception as error:
@@ -141,16 +234,7 @@ def gemini_translate(cues: list[dict], audio: Path, api_key: str) -> list[dict]:
                 pass
     try:
         rows = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I))
-        by_id = {int(row["id"]): row for row in rows}
-        if set(by_id) != set(range(len(cues))): raise ValueError("Gemini đã thay đổi danh sách id")
-        for cue in cues:
-            row = by_id[cue["id"]]
-            cue["text_vi"] = str(row["text_vi"]).strip()
-            cue["speaker"] = re.sub(r"[^A-Za-z0-9_-]", "", str(row.get("speaker", "S1")))[:20] or "S1"
-            gender = str(row.get("gender", "unknown")).lower()
-            cue["gender"] = gender if gender in {"male", "female", "unknown"} else "unknown"
-            if not cue["text_vi"]: raise ValueError("Bản dịch trống")
-        return cues
+        return _apply_translation_rows(cues, rows)
     except Exception as error:
         raise PipelineError("GEMINI_RESPONSE_INVALID", f"Gemini trả JSON không hợp lệ: {error}") from error
 
@@ -170,8 +254,11 @@ def cluster_rectangles(detections: list[tuple[int, dict]], sample_count: int) ->
         if target is None:
             clusters.append({"rect": dict(rect), "frames": {frame_index}, "count": 1})
         else:
-            count = target["count"]
-            for key in ("x", "y", "w", "h"): target["rect"][key] = (target["rect"][key] * count + rect[key]) / (count + 1)
+            current = target["rect"]
+            x1, y1 = min(current["x"], rect["x"]), min(current["y"], rect["y"])
+            x2 = max(current["x"] + current["w"], rect["x"] + rect["w"])
+            y2 = max(current["y"] + current["h"], rect["y"] + rect["h"])
+            target["rect"] = {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
             target["count"] += 1; target["frames"].add(frame_index)
     output = []
     for cluster in clusters:
@@ -179,10 +266,32 @@ def cluster_rectangles(detections: list[tuple[int, dict]], sample_count: int) ->
         persistent = len(cluster["frames"]) >= max(2, math.ceil(sample_count * .18))
         subtitle_band = rect["y"] > .52 and len(cluster["frames"]) >= 2
         if not (persistent or subtitle_band): continue
-        padding_x, padding_y = .012, .01
+        padding_x, padding_y = .025, .012
         x, y = max(0, rect["x"] - padding_x), max(0, rect["y"] - padding_y)
-        output.append({"x": x, "y": y, "w": min(1 - x, rect["w"] + padding_x * 2), "h": min(1 - y, rect["h"] + padding_y * 2)})
+        output.append({
+            "x": x, "y": y, "w": min(1 - x, rect["w"] + padding_x * 2),
+            "h": min(1 - y, rect["h"] + padding_y * 2), "_frames": len(cluster["frames"]),
+        })
+    output.sort(key=lambda item: (item["y"] < .52, -item["_frames"], -item["w"] * item["h"]))
+    for item in output:
+        item.pop("_frames", None)
     return output[:8]
+
+
+def ensure_portrait_subtitle_blur(
+    regions: list[dict], width: int, height: int, subtitle_evidence: list[dict] | None = None,
+) -> list[dict]:
+    regions = [dict(region) for region in regions]
+    if height <= width * 1.2:
+        return regions
+    evidence = subtitle_evidence if subtitle_evidence is not None else regions
+    credible_lower_band = any(
+        region["w"] >= .22 and region["y"] < .82 and region["y"] + region["h"] > .58
+        for region in evidence
+    )
+    if not credible_lower_band:
+        regions.insert(0, {"x": .035, "y": .655, "w": .93, "h": .115})
+    return regions[:8]
 
 
 def _old_ocr_boxes(result: Any, width: int, height: int) -> list[dict]:
@@ -218,12 +327,13 @@ def _v3_ocr_boxes(results: Any, width: int, height: int) -> list[dict]:
 
 
 def detect_blur_regions(source: Path, duration: float) -> list[dict]:
+    width, height = video_size(source)
     try:
         import cv2
-        from paddleocr import PaddleOCR
     except Exception:
-        return []
+        return ensure_portrait_subtitle_blur([], width, height)
     try:
+        from paddleocr import PaddleOCR
         ocr = PaddleOCR(
             lang="ch", ocr_version="PP-OCRv5",
             text_detection_model_name="PP-OCRv5_mobile_det",
@@ -233,36 +343,43 @@ def detect_blur_regions(source: Path, duration: float) -> list[dict]:
         )
     except Exception:
         ocr = None
-    capture = cv2.VideoCapture(str(source)); sample_count = 16; detections = []
+    capture = cv2.VideoCapture(str(source)); sample_count = 24
+    text_detections: list[tuple[int, dict]] = []
+    color_detections: list[tuple[int, dict]] = []
     try:
         for index in range(sample_count):
             capture.set(cv2.CAP_PROP_POS_MSEC, (duration * (index + .5) / sample_count) * 1000)
             ok, frame = capture.read()
             if not ok: continue
-            height, width = frame.shape[:2]
+            frame_height, frame_width = frame.shape[:2]
             boxes = []
             if ocr is not None:
                 try:
-                    boxes = _v3_ocr_boxes(ocr.predict(frame), width, height)
+                    boxes = _v3_ocr_boxes(ocr.predict(frame), frame_width, frame_height)
                 except Exception:
-                    try: boxes = _old_ocr_boxes(ocr.ocr(frame), width, height)
+                    try: boxes = _old_ocr_boxes(ocr.ocr(frame), frame_width, frame_height)
                     except Exception: boxes = []
+            text_detections.extend((index, rect) for rect in boxes if rect["w"] > .015 and rect["h"] > .008)
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             mask = cv2.inRange(hsv, (85, 55, 45), (140, 255, 255))
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            color_boxes = []
             for x, y, w, h in (cv2.boundingRect(contour) for contour in contours):
-                if w * h > width * height * .00012 and w > 8 and h > 5:
-                    boxes.append({"x": x/width, "y": y/height, "w": w/width, "h": h/height})
-            detections.extend((index, rect) for rect in boxes if rect["w"] > .015 and rect["h"] > .008)
+                if w * h > frame_width * frame_height * .00012 and w > 8 and h > 5:
+                    color_boxes.append({"x": x/frame_width, "y": y/frame_height, "w": w/frame_width, "h": h/frame_height})
+            color_detections.extend((index, rect) for rect in color_boxes if rect["w"] > .015 and rect["h"] > .008)
     finally: capture.release()
-    return cluster_rectangles(detections, sample_count)
+    text_regions = cluster_rectangles(text_detections, sample_count)
+    color_regions = cluster_rectangles(color_detections, sample_count)
+    regions = (text_regions + color_regions)[:8]
+    return ensure_portrait_subtitle_blur(regions, width, height, text_regions)
 
 
 def analyze_job(job: dict, _voices: dict) -> None:
     update(job, 4, "Đang tải video Douyin…", status="downloading")
     source = download_douyin(job); job["source"] = source
     update(job, 16, "Đang tách audio và ảnh xem trước…", status="analyzing")
-    duration = media_duration(source); audio, preview = extract_assets(source, job["work_dir"], duration)
+    duration = media_duration(source); dimensions = video_size(source); audio, preview = extract_assets(source, job["work_dir"], duration)
     update(job, 24, "Whisper đang nhận diện lời thoại…")
     cues = transcribe(audio)
     update(job, 36, "Gemini đang dịch và phân biệt người nói…")
@@ -274,8 +391,8 @@ def analyze_job(job: dict, _voices: dict) -> None:
     speakers_by_id = {}
     for cue in cues: speakers_by_id.setdefault(cue["speaker"], cue["gender"])
     speakers = [{"id": key, "gender": value} for key, value in sorted(speakers_by_id.items())]
-    job["cues"] = cues; job["duration"] = duration
-    analysis = {"previewDataUrl": preview, "blurRegions": regions, "subtitleRect": {"x": .08, "y": .75, "w": .84, "h": .17}, "speakers": speakers, "cueCount": len(cues)}
+    job["cues"] = cues; job["duration"] = duration; job["video_size"] = dimensions
+    analysis = {"previewDataUrl": preview, "blurRegions": regions, "subtitleRect": {"x": .08, "y": .78, "w": .84, "h": .16}, "speakers": speakers, "cueCount": len(cues)}
     update(job, 55, "Đã phân tích. Hãy chọn giọng và kiểm tra khung.", status="analysis_ready", analysis=analysis)
 
 
@@ -295,6 +412,30 @@ def _atempo(speed: float) -> str:
     while speed < .5: parts.append("atempo=.5"); speed /= .5
     parts.append(f"atempo={speed:.6f}")
     return ",".join(parts)
+
+
+def plan_dubbing_timeline(cues: list[dict], generated_durations: list[float], video_duration: float, gap: float = .04) -> list[dict]:
+    if len(cues) != len(generated_durations):
+        raise ValueError("Mỗi cue phải có đúng một audio TTS")
+    timeline = []
+    cursor = 0.0
+    for index, (cue, generated) in enumerate(zip(cues, generated_durations)):
+        start = max(float(cue["start"]), cursor)
+        next_start = float(cues[index + 1]["start"]) if index + 1 < len(cues) else video_duration
+        available = max(.25, max(float(cue["end"]), next_start - gap) - start)
+        original_duration = max(.25, float(cue["end"]) - float(cue["start"]))
+        generated = max(.05, float(generated))
+        ideal_for_original = generated / original_duration
+        if ideal_for_original < .90:
+            speed = 1.0
+        elif ideal_for_original <= 1.15:
+            speed = ideal_for_original
+        else:
+            speed = min(1.15, max(1.0, generated / available))
+        end = start + generated / speed
+        timeline.append({"start": start, "end": end, "speed": speed})
+        cursor = end + gap
+    return timeline
 
 
 def _omnivoice():
@@ -326,16 +467,31 @@ def create_dubbing(job: dict, request, voices: dict) -> Path:
     from pydub import AudioSegment
     AudioSegment.converter = ffmpeg()
     directory: Path = job["work_dir"] / "tts"; directory.mkdir(exist_ok=True)
-    final = AudioSegment.silent(duration=int(job["duration"] * 1000) + 500, frame_rate=24000).set_channels(1)
     total = len(job["cues"])
+    generated_files = []
+    generated_durations = []
     for index, cue in enumerate(job["cues"], 1):
-        update(job, 62 + index / total * 16, f"Đang tạo giọng Việt {index}/{total} ({cue['speaker']})…")
+        update(job, 62 + index / total * 12, f"Đang tạo giọng Việt {index}/{total} ({cue['speaker']})…")
         voice = request.voiceMap.get(cue["speaker"]) or request.voiceMap.get("*") or "edge:vi-VN-HoaiMyNeural"
-        raw, fitted = directory / f"{index:04d}.wav", directory / f"{index:04d}-fit.wav"
+        raw = directory / f"{index:04d}.wav"
         synthesize_cue(cue["text_vi"], voice, raw, voices)
-        generated = media_duration(raw); target = max(.25, cue["end"] - cue["start"])
-        run([ffmpeg(), "-y", "-i", str(raw), "-af", _atempo(generated / target), "-ar", "24000", "-ac", "1", str(fitted)], "VOICE_FAILED")
-        final = final.overlay(AudioSegment.from_file(fitted), position=max(0, int(cue["start"] * 1000)))
+        generated_files.append(raw)
+        generated_durations.append(media_duration(raw))
+    timeline = plan_dubbing_timeline(job["cues"], generated_durations, float(job["duration"]))
+    rendered_segments = []
+    for index, (cue, raw, timing) in enumerate(zip(job["cues"], generated_files, timeline), 1):
+        update(job, 74 + index / total * 4, f"Đang căn thời gian giọng Việt {index}/{total}…")
+        fitted = directory / f"{index:04d}-fit.wav"
+        run([ffmpeg(), "-y", "-i", str(raw), "-af", _atempo(timing["speed"]), "-ar", "24000", "-ac", "1", str(fitted)], "VOICE_FAILED")
+        segment = AudioSegment.from_file(fitted).set_frame_rate(24000).set_channels(1)
+        cue["start"] = timing["start"]
+        cue["end"] = timing["start"] + len(segment) / 1000
+        cue["speech_speed"] = timing["speed"]
+        rendered_segments.append((cue["start"], segment))
+    final_duration = max(float(job["duration"]), max(cue["end"] for cue in job["cues"]))
+    final = AudioSegment.silent(duration=math.ceil(final_duration * 1000) + 250, frame_rate=24000).set_channels(1)
+    for start, segment in rendered_segments:
+        final = final.overlay(segment, position=max(0, round(start * 1000)))
     output = job["work_dir"] / "dubbing.wav"; final.export(output, format="wav")
     return output
 
@@ -358,14 +514,24 @@ def ass_time(value: float) -> str:
     return f"{hours}:{minutes:02d}:{seconds:02d}.{cs:02d}"
 
 
-def write_ass(path: Path, cues: list[dict], rect) -> None:
-    size = max(30, min(72, int(rect.h * 260))); x = int((rect.x + rect.w/2) * 1920); y = int((rect.y + rect.h/2) * 1080)
-    header = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n"
-    header += f"Style: Vietnamese,DejaVu Sans,{size},&H00FFFFFF,&H000000FF,&H00101010,&H90000000,-1,0,0,0,100,100,0,0,3,2,1,2,30,30,30,1\n\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+def _wrapped_ass_text(value: str, max_chars: int) -> str:
+    normalized = " ".join(str(value).split())
+    lines = textwrap.wrap(normalized, width=max_chars, break_long_words=False, break_on_hyphens=False) or [""]
+    return "\\N".join(lines)
+
+
+def write_ass(path: Path, cues: list[dict], rect, dimensions: tuple[int, int] = (1920, 1080)) -> None:
+    width, height = dimensions
+    size = max(24, min(64, round(min(width, height) * .052)))
+    x = round((rect.x + rect.w/2) * width); y = round((rect.y + rect.h/2) * height)
+    max_chars = max(16, int(rect.w * width / (size * .56)))
+    header = f"[Script Info]\nScriptType: v4.00+\nPlayResX: {width}\nPlayResY: {height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n"
+    header += f"Style: Vietnamese,Noto Sans,{size},&H00FFFFFF,&H000000FF,&H00101010,&H80000000,-1,0,0,0,100,100,0,0,1,2,1,2,20,20,20,1\n\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
     events = []
     for cue in cues:
-        text = cue["text_vi"].replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}").replace("\n", "\\N")
-        events.append(f"Dialogue: 0,{ass_time(cue['start'])},{ass_time(cue['end'])},Vietnamese,,0,0,0,,{{\\an5\\pos({x},{y})}}{text}")
+        text = cue["text_vi"].replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+        text = _wrapped_ass_text(text, max_chars)
+        events.append(f"Dialogue: 0,{ass_time(cue['start'])},{ass_time(cue['end'])},Vietnamese,,0,0,0,,{{\\an5\\q2\\pos({x},{y})}}{text}")
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8-sig")
 
 
@@ -374,7 +540,7 @@ def video_filter(regions: list, ass_path: Path) -> str:
     for index, rect in enumerate(regions):
         base, crop, blur, out = f"base{index}", f"crop{index}", f"blur{index}", f"v{index}"
         parts.append(f"[{current}]split=2[{base}][{crop}]")
-        parts.append(f"[{crop}]crop=iw*{rect.w:.7f}:ih*{rect.h:.7f}:iw*{rect.x:.7f}:ih*{rect.y:.7f},gblur=sigma=14[{blur}]")
+        parts.append(f"[{crop}]crop=iw*{rect.w:.7f}:ih*{rect.h:.7f}:iw*{rect.x:.7f}:ih*{rect.y:.7f},gblur=sigma=20:steps=3[{blur}]")
         parts.append(f"[{base}][{blur}]overlay=main_w*{rect.x:.7f}:main_h*{rect.y:.7f}[{out}]")
         current = out
     escaped = str(ass_path).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
@@ -387,7 +553,8 @@ def render_job(job: dict, request, voices: dict) -> None:
     dubbing = create_dubbing(job, request, voices)
     background = separate_background(job)
     update(job, 91, "Đang blur, chèn phụ đề và xuất MP4…")
-    ass = job["work_dir"] / "subtitles.ass"; write_ass(ass, job["cues"], request.subtitleRect)
+    dimensions = job.get("video_size") or video_size(job["source"])
+    ass = job["work_dir"] / "subtitles.ass"; write_ass(ass, job["cues"], request.subtitleRect, dimensions)
     result = job["work_dir"] / "result.mp4"
     filters = video_filter(request.blurRegions, ass) + ";[1:a]volume=0.92[bg];[2:a]volume=1.15[dub];[bg][dub]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=.95[aout]"
     run([ffmpeg(), "-y", "-i", str(job["source"]), "-i", str(background), "-i", str(dubbing), "-filter_complex", filters,

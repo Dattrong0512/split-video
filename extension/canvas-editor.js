@@ -1,5 +1,5 @@
 export class CanvasEditor{
-  constructor(canvas){this.canvas=canvas;this.ctx=canvas.getContext("2d");this.image=new Image();this.blurRegions=[];this.subtitleRect={x:.1,y:.74,w:.8,h:.18};this.tool="blur";this.selected=null;this.drag=null;canvas.addEventListener("pointerdown",e=>this.down(e));canvas.addEventListener("pointermove",e=>this.move(e));canvas.addEventListener("pointerup",e=>this.up(e))}
+  constructor(canvas){this.canvas=canvas;this.ctx=canvas.getContext("2d");this.image=new Image();this.blurRegions=[];this.subtitleRect={x:.08,y:.78,w:.84,h:.16};this.tool="blur";this.selected=null;this.drag=null;canvas.addEventListener("pointerdown",e=>this.down(e));canvas.addEventListener("pointermove",e=>this.move(e));canvas.addEventListener("pointerup",e=>this.up(e))}
   async setImage(dataUrl){await new Promise((resolve,reject)=>{this.image.onload=resolve;this.image.onerror=reject;this.image.src=dataUrl});this.canvas.width=this.image.naturalWidth||1280;this.canvas.height=this.image.naturalHeight||720;this.draw()}
   setRegions(regions,subtitle){this.blurRegions=(regions||[]).map(r=>({...r}));if(subtitle)this.subtitleRect={...subtitle};this.selected=null;this.draw()}
   point(event){const r=this.canvas.getBoundingClientRect();return{x:Math.max(0,Math.min(1,(event.clientX-r.left)/r.width)),y:Math.max(0,Math.min(1,(event.clientY-r.top)/r.height))}}
