@@ -166,6 +166,7 @@ testServiceWorkerReinjectsExistingColabTab()
     assert.match(html, /id="preview-seek"/);
     assert.match(html, /id="speech-rate"/);
     assert.match(html, /id="review-video"/);
+    assert.match(html, /id="open-large-review"/);
     assert.match(sidepanel, /\/preview-token/);
     assert.match(sidepanel, /\/review-token/);
     assert.match(sidepanel, /previewOnly/);
@@ -175,6 +176,11 @@ testServiceWorkerReinjectsExistingColabTab()
     assert.match(sidepanel, /addEventListener\("change", commitAuditionedSpeechRate\)/);
     assert.match(sidepanel, /immutableReviews/);
     assert.match(sidepanel, /if \(!previewOnly \|\| !state\.immutableReviews\) \$\("#review-video"\)\.pause\(\)/);
+    assert.match(sidepanel, /sidepanel\.html\?reviewPlayer=1/);
+    assert.match(sidepanel, /reviewPlayerTab/);
+    assert.match(sidepanel, /renderConfig/);
+    assert.match(styles, /body\.review-player-page #review-video/);
+    assert.match(styles, /height: calc\(100vh - 230px\)/);
     assert.match(sidepanel, /DOWNLOAD_PROGRESS/);
     assert.match(canvasEditor, /fitDisplay\(\)/);
     console.log("Extension automation tests passed.");

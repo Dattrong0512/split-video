@@ -2,13 +2,16 @@ import { CanvasEditor } from "./canvas-editor.js";
 import { cookieSummary, deleteClone, listClones, saveClone } from "./storage.js";
 
 const $ = (selector) => document.querySelector(selector);
-const isManualEditorPage = new URLSearchParams(location.search).get("manualEditor") === "1";
+const pageParams = new URLSearchParams(location.search);
+const isManualEditorPage = pageParams.get("manualEditor") === "1";
+const isReviewPlayerPage = pageParams.get("reviewPlayer") === "1";
 if (isManualEditorPage) document.body.classList.add("manual-editor-page");
+if (isReviewPlayerPage) document.body.classList.add("review-player-page");
 const editor = new CanvasEditor($("#preview-canvas"));
 const state = {
   canonicalUrl: "", server: null, jobId: null, stage: "idle", blurMode: "auto",
   clones: [], voices: [], analysis: null, pending: null, pollTimer: null, recoveryCount: 0, downloadId: null,
-  speechRate: 1, previewRate: null, immutableReviews: false, uploadedClones: {},
+  speechRate: 1, previewRate: null, immutableReviews: false, renderConfig: null, uploadedClones: {},
 };
 
 function setStatus(message, progress = null) {
@@ -58,6 +61,7 @@ async function showDubbingReview() {
   video.preservesPitch = true;
   video.src = review.url;
   video.hidden = false;
+  $("#open-large-review").hidden = false;
   video.load();
   state.previewRate = Number(review.speechRate);
   state.speechRate = state.previewRate;
@@ -79,6 +83,7 @@ function invalidateDubbingReview() {
   video.defaultPlaybackRate = 1;
   video.playbackRate = 1;
   video.hidden = true;
+  $("#open-large-review").hidden = true;
   $("#primary").textContent = "Tạo lại preview 30 giây";
   setStatus(`Tốc độ ${state.speechRate.toFixed(2)}× chưa được preview. Hãy tạo lại 30 giây để nghe thử.`, 55);
   persistJob().catch(() => {});
@@ -226,7 +231,8 @@ async function persistJob() {
   if (!state.jobId) return chrome.storage.session.remove("activeJob");
   return chrome.storage.session.set({ activeJob: {
     jobId: state.jobId, canonicalUrl: state.canonicalUrl, stage: state.stage,
-    blurMode: state.blurMode, recoveryCount: state.recoveryCount, speechRate: state.speechRate, updatedAt: Date.now(),
+    blurMode: state.blurMode, recoveryCount: state.recoveryCount, speechRate: state.speechRate,
+    renderConfig: state.renderConfig, updatedAt: Date.now(),
   } });
 }
 
@@ -247,6 +253,27 @@ async function openManualEditor() {
   }
   const tab = await chrome.tabs.create({ url, active: true });
   await chrome.storage.session.set({ manualEditorTab: { tabId: tab.id, jobId: state.jobId } });
+  return tab;
+}
+
+async function openReviewPlayer() {
+  await persistJob();
+  const url = chrome.runtime.getURL("sidepanel.html?reviewPlayer=1");
+  const stored = await chrome.storage.session.get("reviewPlayerTab");
+  const existing = stored.reviewPlayerTab;
+  if (existing?.tabId) {
+    try {
+      const update = existing.jobId === state.jobId ? { active: true } : { active: true, url };
+      const tab = await chrome.tabs.update(existing.tabId, update);
+      if (tab.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
+      await chrome.storage.session.set({ reviewPlayerTab: { tabId: tab.id, jobId: state.jobId } });
+      return tab;
+    } catch (_) {
+      await chrome.storage.session.remove("reviewPlayerTab");
+    }
+  }
+  const tab = await chrome.tabs.create({ url, active: true });
+  await chrome.storage.session.set({ reviewPlayerTab: { tabId: tab.id, jobId: state.jobId } });
   return tab;
 }
 
@@ -329,6 +356,7 @@ async function applyAnalysis(analysis) {
   state.analysis = analysis;
   state.stage = "ready";
   state.previewRate = null;
+  state.renderConfig = null;
   await persistJob();
   if (state.blurMode === "auto") {
     showSpeedCard();
@@ -416,23 +444,37 @@ async function render(previewOnly) {
   setStatus(previewOnly ? "Đang tạo bản nghe thử 30 giây…" : "Đang xuất toàn bộ video với tốc độ đã chọn…", 58);
   try {
     if (!state.server) throw { code: "TUNNEL_DISCONNECTED" };
-    const selections = {};
-    if (state.blurMode === "manual") {
-      const speakerSelects = [...document.querySelectorAll("#speaker-voices select")];
-      if (speakerSelects.length) speakerSelects.forEach((select) => { selections[select.dataset.speaker] = select.value; });
-      else selections["*"] = $("#default-voice").value;
+    let selections;
+    let blurRegions;
+    let subtitleRect;
+    if (isReviewPlayerPage && state.renderConfig) {
+      selections = { ...state.renderConfig.voiceMap };
+      blurRegions = state.renderConfig.blurRegions.map((rect) => ({ ...rect }));
+      subtitleRect = { ...state.renderConfig.subtitleRect };
     } else {
-      selections["*"] = $("#default-voice").value;
+      selections = {};
+      if (state.blurMode === "manual") {
+        const speakerSelects = [...document.querySelectorAll("#speaker-voices select")];
+        if (speakerSelects.length) speakerSelects.forEach((select) => { selections[select.dataset.speaker] = select.value; });
+        else selections["*"] = $("#default-voice").value;
+      } else {
+        selections["*"] = $("#default-voice").value;
+      }
+      const cloneIds = [...new Set(Object.values(selections).filter((value) => value.startsWith("clone:")).map((value) => value.slice(6)))];
+      for (const id of cloneIds) {
+        if (!state.uploadedClones[id]) state.uploadedClones[id] = await uploadClone(id);
+      }
+      for (const [speaker, voice] of Object.entries(selections)) {
+        if (voice.startsWith("clone:")) selections[speaker] = `clone:${state.uploadedClones[voice.slice(6)]}`;
+      }
+      blurRegions = state.blurMode === "manual" ? editor.blurRegions : (state.analysis?.blurRegions || []);
+      subtitleRect = state.blurMode === "manual" ? editor.subtitleRect : (state.analysis?.subtitleRect || { x: .08, y: .78, w: .84, h: .16 });
+      state.renderConfig = {
+        voiceMap: { ...selections },
+        blurRegions: blurRegions.map((rect) => ({ ...rect })),
+        subtitleRect: { ...subtitleRect },
+      };
     }
-    const cloneIds = [...new Set(Object.values(selections).filter((value) => value.startsWith("clone:")).map((value) => value.slice(6)))];
-    for (const id of cloneIds) {
-      if (!state.uploadedClones[id]) state.uploadedClones[id] = await uploadClone(id);
-    }
-    for (const [speaker, voice] of Object.entries(selections)) {
-      if (voice.startsWith("clone:")) selections[speaker] = `clone:${state.uploadedClones[voice.slice(6)]}`;
-    }
-    const blurRegions = state.blurMode === "manual" ? editor.blurRegions : (state.analysis?.blurRegions || []);
-    const subtitleRect = state.blurMode === "manual" ? editor.subtitleRect : (state.analysis?.subtitleRect || { x: .08, y: .78, w: .84, h: .16 });
     await serverFetch(`/api/jobs/${state.jobId}/render`, {
       method: "POST",
       body: JSON.stringify({
@@ -482,6 +524,8 @@ async function resumePending() {
 async function initialize() {
   if (isManualEditorPage) {
     $("header h1").textContent = "Chỉnh blur & subtitle";
+  } else if (isReviewPlayerPage) {
+    $("header h1").textContent = "Preview lồng tiếng 30 giây";
   }
   const [saved, session] = await Promise.all([
     chrome.storage.local.get(["geminiKey", "douyinCookies", "preferredVoice"]),
@@ -501,6 +545,7 @@ async function initialize() {
     state.stage = session.activeJob?.stage || "idle";
     state.recoveryCount = session.activeJob?.recoveryCount || 0;
     state.speechRate = Number(session.activeJob?.speechRate || 1);
+    state.renderConfig = session.activeJob?.renderConfig || null;
     state.pending = session.pendingAction?.action || null;
     document.querySelectorAll("[data-blur-mode]").forEach((button) => button.classList.toggle("active", button.dataset.blurMode === state.blurMode));
   }
@@ -509,6 +554,9 @@ async function initialize() {
   if (isManualEditorPage) {
     const currentTab = await chrome.tabs.getCurrent();
     if (currentTab?.id) await chrome.storage.session.set({ manualEditorTab: { tabId: currentTab.id, jobId: state.jobId } });
+  } else if (isReviewPlayerPage) {
+    const currentTab = await chrome.tabs.getCurrent();
+    if (currentTab?.id) await chrome.storage.session.set({ reviewPlayerTab: { tabId: currentTab.id, jobId: state.jobId } });
   }
   await findCurrentVideo(Boolean(state.canonicalUrl));
 
@@ -549,11 +597,13 @@ $("#toggle-settings").addEventListener("click", () => { const body = $("#setting
 $("#refresh-video").addEventListener("click", () => findCurrentVideo());
 $("#default-voice").addEventListener("change", () => {
   chrome.storage.local.set({ preferredVoice: $("#default-voice").value });
+  state.renderConfig = null;
   invalidateDubbingReview();
 });
+$("#open-large-review").addEventListener("click", openReviewPlayer);
 $("#primary").addEventListener("click", async () => {
   if (state.stage === "ready") {
-    if (state.blurMode === "manual" && !isManualEditorPage) return openManualEditor();
+    if (state.blurMode === "manual" && !isManualEditorPage && !isReviewPlayerPage) return openManualEditor();
     return render(true);
   }
   if (state.stage === "preview_ready") return render(false);
@@ -569,6 +619,7 @@ $("#cancel").addEventListener("click", async () => {
   clearTimeout(state.pollTimer);
   state.jobId = null; state.stage = "idle"; state.analysis = null;
   state.previewRate = null;
+  state.renderConfig = null;
   await chrome.storage.session.remove(["activeJob", "pendingAction"]);
   setBusy(false); setStatus("Đã hủy.", 0);
 });
@@ -584,7 +635,7 @@ $("#speech-rate").addEventListener("input", (event) => {
   auditionSpeechRate();
 });
 $("#speech-rate").addEventListener("change", commitAuditionedSpeechRate);
-$("#speaker-voices").addEventListener("change", invalidateDubbingReview);
+$("#speaker-voices").addEventListener("change", () => { state.renderConfig = null; invalidateDubbingReview(); });
 $("#tool-blur").addEventListener("click", () => { editor.tool = "blur"; $("#tool-blur").classList.add("active"); $("#tool-subtitle").classList.remove("active"); });
 $("#tool-subtitle").addEventListener("click", () => { editor.tool = "subtitle"; $("#tool-subtitle").classList.add("active"); $("#tool-blur").classList.remove("active"); });
 $("#delete-region").addEventListener("click", () => editor.deleteSelected());
