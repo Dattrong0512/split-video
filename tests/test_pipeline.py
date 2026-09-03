@@ -11,7 +11,7 @@ from backend.pipeline import (
     _old_ocr_rows, _screen_subtitle_text, _translation_cue_payload, _translation_prompt, _translation_schema,
     _v3_ocr_boxes, _v3_ocr_rows, audio_mix_filter, cluster_rectangles, encoding_options, media_duration,
     ensure_portrait_subtitle_blur, plan_dubbing_timeline, transcribe,
-    render_job, repeated_tts_tail_cutoff, synthesize_cue, synthesize_verified_clone, tts_text_score,
+    render_job, repeated_tts_tail_cutoff, separate_background, synthesize_cue, synthesize_verified_clone, tts_text_score,
     video_filter, write_ass,
 )
 
@@ -228,6 +228,15 @@ class PipelineHelpersTest(unittest.TestCase):
         recognized = expected + " Sao sao sao."
         self.assertLess(tts_text_score(expected, recognized), .68)
 
+    def test_transcript_gate_rejects_mid_sentence_stutter(self):
+        expected = "Tôi không biết vì sao chuyện này lại xảy ra."
+        recognized = "Tôi không biết vì sao sao sao sao chuyện này lại xảy ra."
+        self.assertLess(tts_text_score(expected, recognized), .68)
+
+    def test_transcript_gate_accepts_legitimate_repeated_word(self):
+        text = "Ba ba ba đều là những người cha tốt."
+        self.assertGreater(tts_text_score(text, text), .8)
+
     def test_transcript_gate_accepts_clean_vietnamese_line(self):
         text = "Tôi không biết tại sao."
         self.assertEqual(tts_text_score(text, text), 1.0)
@@ -291,7 +300,47 @@ class PipelineHelpersTest(unittest.TestCase):
         rect = SimpleNamespace(x=.1, y=.4, w=.8, h=.16)
         filters = video_filter([], Path("subtitles.ass"), rect)
         self.assertIn("gblur=sigma=10:steps=2", filters)
-        self.assertIn("color=black@0.26:t=fill", filters)
+        self.assertIn("color=white@0.16:t=fill", filters)
+        self.assertNotIn("color=black", filters)
+
+    def test_background_keeps_music_and_a_quiet_original_voice(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            stems = root / "separated" / "htdemucs" / "source"
+            stems.mkdir(parents=True)
+            no_vocals = stems / "no_vocals.wav"
+            vocals = stems / "vocals.wav"
+            no_vocals.write_bytes(b"music")
+            vocals.write_bytes(b"voice")
+            job = {"work_dir": root, "source": root / "source.mp4"}
+
+            with patch("backend.pipeline.subprocess.run", return_value=SimpleNamespace(returncode=0)), patch(
+                "backend.pipeline.ffmpeg", return_value="ffmpeg"
+            ), patch("backend.pipeline.run") as run_command:
+                background = separate_background(job)
+
+            self.assertEqual(background, root / "background-with-original-voice.wav")
+            command = run_command.call_args.args[0]
+            self.assertIn(str(no_vocals), command)
+            self.assertIn(str(vocals), command)
+            mix_filter = command[command.index("-filter_complex") + 1]
+            self.assertIn("volume=0.12", mix_filter)
+            self.assertIn("amix=inputs=2:duration=longest:normalize=0", mix_filter)
+
+    def test_background_fallback_keeps_original_audio_quiet(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = {"work_dir": root, "source": root / "source.mp4"}
+
+            with patch("backend.pipeline.subprocess.run", return_value=SimpleNamespace(returncode=1)), patch(
+                "backend.pipeline.ffmpeg", return_value="ffmpeg"
+            ), patch("backend.pipeline.run") as run_command:
+                background = separate_background(job)
+
+            self.assertEqual(background, root / "background.wav")
+            command = run_command.call_args.args[0]
+            self.assertEqual(command[command.index("-af") + 1], "volume=0.16")
+            self.assertIn("audio gốc ở mức nhỏ", job["warning"])
 
     def test_render_audio_and_container_are_limited_to_source_duration(self):
         filters = audio_mix_filter(74.1)

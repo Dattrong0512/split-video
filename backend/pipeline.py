@@ -584,6 +584,22 @@ def trim_repeated_tts_tail(path: Path, text: str) -> bool:
         return False
 
 
+def _max_consecutive_tokens(tokens: list[str], token: str) -> int:
+    best = run = 0
+    for item in tokens:
+        run = run + 1 if item == token else 0
+        best = max(best, run)
+    return best
+
+
+def _repetition_penalty(expected: list[str], recognized: list[str]) -> bool:
+    for token in set(recognized):
+        recognized_run = _max_consecutive_tokens(recognized, token)
+        if recognized_run >= 3 and recognized_run > _max_consecutive_tokens(expected, token):
+            return True
+    return False
+
+
 def tts_text_score(expected_text: str, recognized_text: str) -> float:
     expected = _spoken_tokens(expected_text)
     recognized = _spoken_tokens(recognized_text)
@@ -594,19 +610,8 @@ def tts_text_score(expected_text: str, recognized_text: str) -> float:
     matching = sum(block.size for block in blocks)
     score = matching / max(len(expected), len(recognized))
 
-    tail_token = recognized[-1]
-    recognized_suffix = 0
-    for token in reversed(recognized):
-        if token != tail_token:
-            break
-        recognized_suffix += 1
-    expected_suffix = 0
-    for token in reversed(expected):
-        if token != tail_token:
-            break
-        expected_suffix += 1
-    if recognized_suffix >= 2 and recognized_suffix > expected_suffix:
-        return min(score, .4)
+    if _repetition_penalty(expected, recognized):
+        return min(score, .35)
 
     last_match_end = max((block.b + block.size for block in blocks), default=0)
     if len(recognized) - last_match_end >= 2:
@@ -644,7 +649,7 @@ def synthesize_verified_clone(
                 best_path, best_score = candidate, score
             if score >= .82:
                 break
-        if best_path is not None and best_score >= .68:
+        if best_path is not None and best_score >= .75:
             shutil.copyfile(best_path, raw)
             return best_score, False
         synthesize_cue(text, "edge:vi-VN-HoaiMyNeural", raw, voices)
@@ -781,16 +786,27 @@ def separate_background(job: dict) -> Path:
     if cached and Path(cached).exists():
         return Path(cached)
     output = job["work_dir"] / "separated"
-    update(job, 79, "Đang tách sạch giọng gốc, chỉ giữ nhạc và hiệu ứng…")
+    update(job, 79, "Đang tách nhạc nền và giữ nhỏ giọng gốc…")
     result = subprocess.run([sys.executable, "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs", "-o", str(output), str(job["source"])], capture_output=True, text=True)
-    candidates = list(output.glob("**/no_vocals.wav"))
-    background = candidates[0] if candidates else None
-    if result.returncode or background is None:
+    music_candidates = list(output.glob("**/no_vocals.wav"))
+    vocal_candidates = list(output.glob("**/vocals.wav"))
+    music = music_candidates[0] if music_candidates else None
+    vocals = vocal_candidates[0] if vocal_candidates else None
+    if result.returncode or music is None or vocals is None:
         fallback = job["work_dir"] / "background.wav"
-        run([ffmpeg(), "-y", "-i", str(job["source"]), "-vn", "-af", "volume=0", str(fallback)], "AUDIO_SEPARATION_FAILED")
-        job["warning"] = "Demucs không tách được vocal; đã tắt audio nguồn để không lọt giọng gốc."
+        run([ffmpeg(), "-y", "-i", str(job["source"]), "-vn", "-af", "volume=0.16", str(fallback)], "AUDIO_SEPARATION_FAILED")
+        job["warning"] = "Demucs không tách được vocal; đã giữ toàn bộ audio gốc ở mức nhỏ."
         job["background"] = fallback
         return fallback
+    background = job["work_dir"] / "background-with-original-voice.wav"
+    bed_filter = (
+        "[0:a]volume=1.0[music];[1:a]volume=0.12[voice];"
+        "[music][voice]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=.95[bed]"
+    )
+    run([
+        ffmpeg(), "-y", "-i", str(music), "-i", str(vocals),
+        "-filter_complex", bed_filter, "-map", "[bed]", "-ar", "44100", "-ac", "2", str(background),
+    ], "AUDIO_SEPARATION_FAILED")
     job["background"] = background
     return background
 
@@ -840,7 +856,7 @@ def video_filter(regions: list, ass_path: Path, subtitle_rect=None) -> str:
         parts.append(
             f"[{base}][{blur}]overlay=main_w*{subtitle_rect.x:.7f}:main_h*{subtitle_rect.y:.7f},"
             f"drawbox=x=iw*{subtitle_rect.x:.7f}:y=ih*{subtitle_rect.y:.7f}:"
-            f"w=iw*{subtitle_rect.w:.7f}:h=ih*{subtitle_rect.h:.7f}:color=black@0.26:t=fill[{panel}]"
+            f"w=iw*{subtitle_rect.w:.7f}:h=ih*{subtitle_rect.h:.7f}:color=white@0.16:t=fill[{panel}]"
         )
         current = panel
     escaped = str(ass_path).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
