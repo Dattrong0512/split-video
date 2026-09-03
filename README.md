@@ -19,11 +19,11 @@ Chrome extension lấy video Douyin đang hiển thị, tạo phụ đề và l�
 
 1. Mở video trên `douyin.com`; có thể là trang feed/discover hoặc URL `/video/<id>`.
 2. Bấm biểu tượng extension để mở side panel. Extension tự lấy URL chuẩn của video đang phát.
-3. Chọn preset Hoài My/Nam Minh hoặc thêm voice clone. Giữ chế độ **Tự động** và bấm phân tích.
+3. Chọn số giọng nhân vật. Mặc định **1** dùng cùng một preset/voice clone cho toàn bộ lời thoại. Nếu video có nhiều nhân vật, chọn **2**, **3** hoặc **4** rồi gán một giọng cho từng vai trước khi bấm phân tích.
 4. Extension tự tạo bản xem trước 30 giây và tự dừng video Douyin gốc để âm thanh không phát chồng. Bấm **Mở preview lớn trong tab riêng** nếu cần xem toàn khung hình; player nhỏ sẽ dừng và tab lớn tiếp tục đúng câu/thời điểm hiện tại. Tab lớn vẫn có thanh tốc độ và nút xuất. Kéo tốc độ giọng trong khoảng 0,80–1,40× để nghe phản hồi tức thì; khi thả thanh, extension tự tạo lại preview chính xác rồi tiếp tục ở vị trí đang nghe. Khi đã khớp giọng gốc, bấm xuất toàn bộ video.
 5. Bạn có thể bấm **Run all** trong `OmniVoice_API.ipynb` trước rồi mới bấm **Phân tích video**. Extension sẽ gắn vào đúng tab Colab đang mở và dùng server đã chạy; nó không refresh notebook hoặc mở thêm tab. Nếu chưa có notebook, extension mới tự mở một tab, kết nối GPU T4 và chạy notebook. Giữ tab Colab mở cho tới khi tải bắt đầu.
 
-Pipeline dùng Whisper nhận dạng lời nói rồi để Gemini sửa transcript và viết lại tiếng Việt theo nguyên timestamp từng cue; OCR chỉ phục vụ tìm vùng blur. Nhịp TTS được fit về thời lượng câu gốc trong khoảng tự nhiên 0,90–1,15×. Audio xuất chỉ giữ `no_vocals` từ Demucs cùng giọng Việt; vocal gốc không còn được trộn lại.
+Pipeline dùng Whisper nhận dạng lời nói rồi để Gemini sửa transcript và viết lại tiếng Việt theo nguyên timestamp từng cue; OCR chỉ phục vụ tìm vùng blur. Với một giọng, mọi cue bị khóa vào cùng vai `S1`. Với 2–4 giọng, Gemini chỉ được dùng các vai đã chọn và phải giữ cùng mã cho cùng nhân vật/góc nhìn. Nhịp TTS được fit về thời lượng câu gốc trong khoảng tự nhiên 0,90–1,15×. Audio xuất chỉ giữ `no_vocals` từ Demucs cùng giọng Việt; vocal gốc không còn được trộn lại. Nếu Demucs thất bại, pipeline dùng nền im lặng thay vì đưa giọng gốc trở lại.
 
 Với voice clone, OmniVoice được tạo ở 32 bước và nhận trực tiếp thời lượng cue gốc. Whisper kiểm tra transcript của toàn bộ clip tạo ra, không chỉ phần đuôi. Generation sai được thử lại tối đa ba lần; nếu vẫn không khớp câu đích, riêng cue lỗi chuyển sang Hoài My thay vì cho âm lặp/hallucination đi vào video. Cache TTS cũ sẽ tự bị loại khi thuật toán tạo giọng thay đổi.
 

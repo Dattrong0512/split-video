@@ -6,7 +6,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import backend.server as server
-from backend.models import Rect, RenderRequest
+from backend.models import AnalyzeRequest, Rect, RenderRequest
 from pydantic import ValidationError
 
 
@@ -26,7 +26,7 @@ class ServerContractTest(unittest.TestCase):
     def test_health_lists_vietnamese_presets(self):
         response = self.client.get("/api/health", headers=self.auth)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["apiVersion"], "1.4.5")
+        self.assertEqual(response.json()["apiVersion"], "1.5.0")
         self.assertTrue(response.json()["immutableReviews"])
         self.assertEqual([voice["id"] for voice in response.json()["voices"]], [
             "edge:vi-VN-HoaiMyNeural", "edge:vi-VN-NamMinhNeural"
@@ -46,6 +46,21 @@ class ServerContractTest(unittest.TestCase):
     def test_rectangles_must_stay_inside_video(self):
         with self.assertRaises(ValidationError):
             Rect(x=.9, y=.1, w=.2, h=.2)
+
+    def test_analysis_defaults_to_one_voice_and_limits_character_voices_to_four(self):
+        request = AnalyzeRequest(
+            canonicalUrl="https://www.douyin.com/video/7674912144722875109",
+            cookieText="cookie",
+            geminiApiKey="not-a-real-key",
+        )
+        self.assertEqual(request.voiceCount, 1)
+        with self.assertRaises(ValidationError):
+            AnalyzeRequest(
+                canonicalUrl="https://www.douyin.com/video/7674912144722875109",
+                cookieText="cookie",
+                geminiApiKey="not-a-real-key",
+                voiceCount=5,
+            )
 
     def test_render_request_limits_blur_count(self):
         with self.assertRaises(ValidationError):
@@ -77,6 +92,7 @@ class ServerContractTest(unittest.TestCase):
                 "cookieText": "cookie",
                 "geminiApiKey": "not-a-real-key",
                 "blurMode": "auto",
+                "voiceCount": 3,
             })
         job_id = response.json()["jobId"]
         try:
@@ -84,6 +100,7 @@ class ServerContractTest(unittest.TestCase):
             self.assertEqual(job["status"], "queued")
             self.assertNotIn("GPU", job["message"])
             self.assertIn("phân tích", job["message"])
+            self.assertEqual(job["voice_count"], 3)
         finally:
             server.cleanup_job(job_id)
 

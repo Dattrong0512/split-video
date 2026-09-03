@@ -2,7 +2,7 @@ import { CanvasEditor } from "./canvas-editor.js";
 import { cookieSummary, deleteClone, listClones, saveClone } from "./storage.js";
 
 const $ = (selector) => document.querySelector(selector);
-const EXPECTED_API_VERSION = "1.4.5";
+const EXPECTED_API_VERSION = "1.5.0";
 const pageParams = new URLSearchParams(location.search);
 const isManualEditorPage = pageParams.get("manualEditor") === "1";
 const isReviewPlayerPage = pageParams.get("reviewPlayer") === "1";
@@ -15,7 +15,7 @@ const state = {
   canonicalUrl: "", server: null, jobId: null, stage: "idle", blurMode: "auto",
   clones: [], voices: [], analysis: null, pending: null, pollTimer: null, recoveryCount: 0, downloadId: null,
   speechRate: 1, previewRate: null, immutableReviews: false, renderConfig: null, uploadedClones: {},
-  reviewResume: null,
+  reviewResume: null, voiceCount: 1, voiceSelections: {},
 };
 
 function reviewSnapshot(shouldPlay = null) {
@@ -56,6 +56,7 @@ function setBusy(busy) {
   $("#primary").disabled = busy;
   $("#cancel").hidden = !busy || !state.jobId;
   $("#speech-rate").disabled = busy;
+  $("#voice-count").disabled = busy || Boolean(state.jobId);
   document.querySelectorAll("[data-blur-mode]").forEach((button) => { button.disabled = busy; });
 }
 
@@ -268,6 +269,51 @@ function rebuildVoices(preferred = $("#default-voice").value) {
   document.querySelectorAll("#speaker-voices select").forEach((select) => fillVoiceSelect(select, select.value || preferred));
 }
 
+function speakerLabel(speakerId) {
+  const speaker = state.analysis?.speakers?.find((item) => item.id === speakerId);
+  const gender = speaker?.gender === "female" ? " · Nữ" : speaker?.gender === "male" ? " · Nam" : "";
+  return `Nhân vật ${speakerId.slice(1)}${gender}`;
+}
+
+function collectVoiceSelections() {
+  if (state.voiceCount === 1) return { "*": $("#default-voice").value };
+  const selections = { S1: $("#default-voice").value };
+  for (let index = 2; index <= state.voiceCount; index += 1) {
+    const select = document.querySelector(`#speaker-voices select[data-speaker="S${index}"]`);
+    selections[`S${index}`] = select?.value || $("#default-voice").value;
+  }
+  return selections;
+}
+
+function rememberVoiceSelections() {
+  const current = collectVoiceSelections();
+  if (current["*"]) state.voiceSelections.S1 = current["*"];
+  else Object.assign(state.voiceSelections, current);
+  return chrome.storage.local.set({
+    preferredVoice: state.voiceSelections.S1,
+    preferredVoiceCount: state.voiceCount,
+    preferredVoiceMap: state.voiceSelections,
+  });
+}
+
+function rebuildVoiceSlots() {
+  $("#default-voice-label").textContent = speakerLabel("S1");
+  const container = $("#speaker-voices");
+  container.replaceChildren();
+  container.hidden = state.voiceCount === 1;
+  for (let index = 2; index <= state.voiceCount; index += 1) {
+    const speakerId = `S${index}`;
+    const row = document.createElement("div"); row.className = "speaker-row";
+    const label = document.createElement("span"); label.textContent = speakerLabel(speakerId);
+    const select = document.createElement("select"); select.dataset.speaker = speakerId;
+    fillVoiceSelect(select, state.voiceSelections[speakerId] || $("#default-voice").value);
+    row.append(label, select); container.append(row);
+  }
+  $("#voice-help").textContent = state.voiceCount === 1
+    ? "Một giọng duy nhất sẽ được dùng cho mọi nhân vật trong video."
+    : `Gán giọng cho ${state.voiceCount} vai nói. AI giữ cùng một mã nhân vật xuyên suốt các câu.`;
+}
+
 async function storePending(action) {
   state.pending = action;
   await chrome.storage.session.set({ pendingAction: { action, canonicalUrl: state.canonicalUrl, blurMode: state.blurMode, createdAt: Date.now() } });
@@ -282,7 +328,8 @@ async function persistJob() {
   if (!state.jobId) return chrome.storage.session.remove("activeJob");
   return chrome.storage.session.set({ activeJob: {
     jobId: state.jobId, canonicalUrl: state.canonicalUrl, stage: state.stage,
-    blurMode: state.blurMode, recoveryCount: state.recoveryCount, speechRate: state.speechRate,
+    blurMode: state.blurMode, voiceCount: state.voiceCount,
+    recoveryCount: state.recoveryCount, speechRate: state.speechRate,
     renderConfig: state.renderConfig, updatedAt: Date.now(),
   } });
 }
@@ -352,7 +399,7 @@ async function ensureServer(action) {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.4.5 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.0 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
@@ -393,7 +440,7 @@ async function analyze() {
       method: "POST",
       body: JSON.stringify({
         canonicalUrl: state.canonicalUrl, cookieText: saved.douyinCookies,
-        geminiApiKey: saved.geminiKey, blurMode: state.blurMode,
+        geminiApiKey: saved.geminiKey, blurMode: state.blurMode, voiceCount: state.voiceCount,
       }),
     });
     state.jobId = response.jobId;
@@ -408,18 +455,8 @@ async function analyze() {
 }
 
 function showSpeakers(speakers) {
-  const container = $("#speaker-voices");
-  container.replaceChildren();
-  if (!speakers || speakers.length <= 1) { container.hidden = true; return; }
-  container.hidden = false;
-  for (const speaker of speakers) {
-    const row = document.createElement("div"); row.className = "speaker-row";
-    const label = document.createElement("span");
-    label.textContent = `${speaker.id} · ${speaker.gender === "female" ? "Nữ" : speaker.gender === "male" ? "Nam" : "?"}`;
-    const select = document.createElement("select"); select.dataset.speaker = speaker.id;
-    fillVoiceSelect(select, $("#default-voice").value);
-    row.append(label, select); container.append(row);
-  }
+  state.analysis.speakers = speakers || [];
+  rebuildVoiceSlots();
 }
 
 async function applyAnalysis(analysis) {
@@ -428,6 +465,7 @@ async function applyAnalysis(analysis) {
   state.previewRate = null;
   state.renderConfig = null;
   await persistJob();
+  showSpeakers(analysis.speakers);
   if (state.blurMode === "auto") {
     showSpeedCard();
     setStatus("Đã phân tích. Đang tự tạo preview 30 giây để kiểm tra tốc độ giọng…", 56);
@@ -446,7 +484,6 @@ async function applyAnalysis(analysis) {
   let previewReady = true;
   try { await setupVideoPreview(); }
   catch (_) { previewReady = false; $("#preview-controls").hidden = true; }
-  showSpeakers(analysis.speakers);
   showSpeedCard();
   setBusy(false);
   setStatus(previewReady ? "Đã phân tích. Chỉnh khung rồi tạo preview 30 giây để nghe tốc độ." : "Đã phân tích. Hãy chỉnh trên ảnh tĩnh rồi tạo preview 30 giây.", 55);
@@ -529,14 +566,7 @@ async function render(previewOnly) {
       blurRegions = state.renderConfig.blurRegions.map((rect) => ({ ...rect }));
       subtitleRect = { ...state.renderConfig.subtitleRect };
     } else {
-      selections = {};
-      if (state.blurMode === "manual") {
-        const speakerSelects = [...document.querySelectorAll("#speaker-voices select")];
-        if (speakerSelects.length) speakerSelects.forEach((select) => { selections[select.dataset.speaker] = select.value; });
-        else selections["*"] = $("#default-voice").value;
-      } else {
-        selections["*"] = $("#default-voice").value;
-      }
+      selections = collectVoiceSelections();
       const cloneIds = [...new Set(Object.values(selections).filter((value) => value.startsWith("clone:")).map((value) => value.slice(6)))];
       for (const id of cloneIds) {
         if (!state.uploadedClones[id]) state.uploadedClones[id] = await uploadClone(id);
@@ -605,19 +635,27 @@ async function initialize() {
     $("header h1").textContent = "Preview lồng tiếng 30 giây";
   }
   const [saved, session] = await Promise.all([
-    chrome.storage.local.get(["geminiKey", "douyinCookies", "preferredVoice"]),
+    chrome.storage.local.get(["geminiKey", "douyinCookies", "preferredVoice", "preferredVoiceCount", "preferredVoiceMap"]),
     chrome.storage.session.get(["serverSession", "pendingAction", "activeJob", "colabProgress", "reviewHandoff"]),
   ]);
   $("#gemini-key").value = saved.geminiKey || "";
   $("#cookie-status").textContent = saved.douyinCookies ? cookieSummary(saved.douyinCookies).label : "Chưa có cookie.";
   state.clones = await listClones();
-  rebuildVoices(saved.preferredVoice);
+  state.voiceCount = Math.max(1, Math.min(4, Number(saved.preferredVoiceCount || 1)));
+  state.voiceSelections = { ...(saved.preferredVoiceMap || {}) };
+  if (!state.voiceSelections.S1 && saved.preferredVoice) state.voiceSelections.S1 = saved.preferredVoice;
+  $("#voice-count").value = String(state.voiceCount);
+  rebuildVoices(state.voiceSelections.S1 || saved.preferredVoice);
+  rebuildVoiceSlots();
   if (saved.geminiKey && saved.douyinCookies) { $("#settings-body").hidden = true; $("#toggle-settings").textContent = "Hiện"; }
 
   const restored = session.activeJob || session.pendingAction;
   if (restored) {
     state.canonicalUrl = restored.canonicalUrl || "";
     state.blurMode = restored.blurMode || "auto";
+    state.voiceCount = Math.max(1, Math.min(4, Number(restored.voiceCount || state.voiceCount)));
+    $("#voice-count").value = String(state.voiceCount);
+    rebuildVoiceSlots();
     state.jobId = session.activeJob?.jobId || null;
     state.stage = session.activeJob?.stage || "idle";
     state.recoveryCount = session.activeJob?.recoveryCount || 0;
@@ -657,7 +695,7 @@ async function initialize() {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.4.5 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.0 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
@@ -689,7 +727,18 @@ $("#clear-cookie").addEventListener("click", async () => { await chrome.storage.
 $("#toggle-settings").addEventListener("click", () => { const body = $("#settings-body"); body.hidden = !body.hidden; $("#toggle-settings").textContent = body.hidden ? "Hiện" : "Ẩn"; });
 $("#refresh-video").addEventListener("click", () => findCurrentVideo());
 $("#default-voice").addEventListener("change", () => {
-  chrome.storage.local.set({ preferredVoice: $("#default-voice").value });
+  state.voiceSelections.S1 = $("#default-voice").value;
+  rememberVoiceSelections();
+  state.renderConfig = null;
+  invalidateDubbingReview();
+});
+$("#voice-count").addEventListener("change", async (event) => {
+  const previous = collectVoiceSelections();
+  if (previous["*"]) state.voiceSelections.S1 = previous["*"];
+  else Object.assign(state.voiceSelections, previous);
+  state.voiceCount = Math.max(1, Math.min(4, Number(event.target.value || 1)));
+  rebuildVoiceSlots();
+  await rememberVoiceSelections();
   state.renderConfig = null;
   invalidateDubbingReview();
 });
@@ -740,7 +789,11 @@ $("#speech-rate").addEventListener("input", (event) => {
   auditionSpeechRate();
 });
 $("#speech-rate").addEventListener("change", commitAuditionedSpeechRate);
-$("#speaker-voices").addEventListener("change", () => { state.renderConfig = null; invalidateDubbingReview(); });
+$("#speaker-voices").addEventListener("change", () => {
+  rememberVoiceSelections();
+  state.renderConfig = null;
+  invalidateDubbingReview();
+});
 $("#tool-blur").addEventListener("click", () => { editor.tool = "blur"; $("#tool-blur").classList.add("active"); $("#tool-subtitle").classList.remove("active"); });
 $("#tool-subtitle").addEventListener("click", () => { editor.tool = "subtitle"; $("#tool-subtitle").classList.add("active"); $("#tool-blur").classList.remove("active"); });
 $("#delete-region").addEventListener("click", () => editor.deleteSelected());

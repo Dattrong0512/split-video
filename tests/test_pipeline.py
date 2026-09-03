@@ -125,6 +125,34 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertEqual(translated[0]["text_vi"], "Xin chào.")
         self.assertEqual(translated[0]["confidence"], .96)
 
+    def test_one_voice_mode_forces_every_cue_to_the_same_speaker_slot(self):
+        cues = [
+            {"id": 0, "start": 0, "end": 1, "original": "你好"},
+            {"id": 1, "start": 1, "end": 2, "original": "再见"},
+        ]
+        rows = [
+            {"id": 0, "original_corrected": "你好", "text_vi": "Xin chào.", "speaker": "S1", "gender": "female", "confidence": .9},
+            {"id": 1, "original_corrected": "再见", "text_vi": "Tạm biệt.", "speaker": "S2", "gender": "male", "confidence": .9},
+        ]
+
+        translated = _apply_translation_rows(cues, rows, speaker_count=1)
+
+        self.assertEqual([cue["speaker"] for cue in translated], ["S1", "S1"])
+
+    def test_multi_voice_mode_restricts_speakers_to_selected_slots(self):
+        cues = [
+            {"id": 0, "start": 0, "end": 1, "original": "甲"},
+            {"id": 1, "start": 1, "end": 2, "original": "乙"},
+        ]
+        rows = [
+            {"id": 0, "original_corrected": "甲", "text_vi": "Một.", "speaker": "S2", "gender": "male", "confidence": .9},
+            {"id": 1, "original_corrected": "乙", "text_vi": "Hai.", "speaker": "S9", "gender": "female", "confidence": .9},
+        ]
+
+        translated = _apply_translation_rows(cues, rows, speaker_count=2)
+
+        self.assertEqual([cue["speaker"] for cue in translated], ["S2", "S1"])
+
     def test_translation_payload_uses_speech_and_preserves_timestamps(self):
         payload = _translation_cue_payload({
             "id": 2, "start": 1, "end": 2, "original": "需要修改的听写", "screen_text": "不应发送给Gemini",
@@ -303,7 +331,7 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertIn("color=white@0.16:t=fill", filters)
         self.assertNotIn("color=black", filters)
 
-    def test_background_keeps_music_and_a_quiet_original_voice(self):
+    def test_background_uses_music_without_original_voice(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             stems = root / "separated" / "htdemucs" / "source"
@@ -319,15 +347,11 @@ class PipelineHelpersTest(unittest.TestCase):
             ), patch("backend.pipeline.run") as run_command:
                 background = separate_background(job)
 
-            self.assertEqual(background, root / "background-with-original-voice.wav")
-            command = run_command.call_args.args[0]
-            self.assertIn(str(no_vocals), command)
-            self.assertIn(str(vocals), command)
-            mix_filter = command[command.index("-filter_complex") + 1]
-            self.assertIn("volume=0.12", mix_filter)
-            self.assertIn("amix=inputs=2:duration=longest:normalize=0", mix_filter)
+            self.assertEqual(background, no_vocals)
+            run_command.assert_not_called()
+            self.assertNotIn("original", background.name)
 
-    def test_background_fallback_keeps_original_audio_quiet(self):
+    def test_background_fallback_uses_silence_instead_of_original_voice(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             job = {"work_dir": root, "source": root / "source.mp4"}
@@ -339,8 +363,9 @@ class PipelineHelpersTest(unittest.TestCase):
 
             self.assertEqual(background, root / "background.wav")
             command = run_command.call_args.args[0]
-            self.assertEqual(command[command.index("-af") + 1], "volume=0.16")
-            self.assertIn("audio gốc ở mức nhỏ", job["warning"])
+            self.assertIn("anullsrc", command)
+            self.assertNotIn(str(job["source"]), command)
+            self.assertIn("không giữ giọng gốc", job["warning"])
 
     def test_render_audio_and_container_are_limited_to_source_duration(self):
         filters = audio_mix_filter(74.1)

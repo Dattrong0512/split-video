@@ -19,7 +19,12 @@
     </section>
     <section id="voice-card" class="card">
       <div class="section-title"><span>Giọng lồng tiếng</span><button id="add-clone" class="link">+ Clone giọng</button></div>
-      <div class="row"><select id="default-voice"></select><button id="delete-clone" class="secondary" title="Xóa voice clone đang chọn">Xóa</button></div><input id="clone-file" type="file" accept="audio/*,video/*" hidden><div id="speaker-voices" hidden></div>
+      <div class="voice-count-row"><label for="voice-count">Số giọng nhân vật</label><select id="voice-count"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></div>
+      <div class="speaker-row"><span id="default-voice-label">Nhân vật 1</span><select id="default-voice"></select></div>
+      <div id="speaker-voices" hidden></div>
+      <button id="delete-clone" class="secondary full" title="Xóa voice clone đang chọn">Xóa voice clone đã chọn</button>
+      <input id="clone-file" type="file" accept="audio/*,video/*" hidden>
+      <small id="voice-help">Mặc định 1 giọng dùng cùng một giọng cho mọi nhân vật. Chọn 2–4 để gán riêng từng giọng theo vai nói.</small>
     </section>
     <section class="card mode-card">
       <div class="section-title"><span>Xử lý khung</span><span id="frame-mode-label">Tự động + duyệt 30 giây</span></div>

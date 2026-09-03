@@ -22,6 +22,7 @@ class AnalyzeRequest(BaseModel):
     cookieText: str = Field(min_length=1, max_length=2_000_000)
     geminiApiKey: str = Field(min_length=10, max_length=512)
     blurMode: Literal["auto", "manual"] = "auto"
+    voiceCount: int = Field(default=1, ge=1, le=4)
 
 
 class RenderRequest(BaseModel):

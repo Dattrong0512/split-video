@@ -180,13 +180,14 @@ def _translation_schema() -> dict:
     }
 
 
-def _apply_translation_rows(cues: list[dict], rows: Any) -> list[dict]:
+def _apply_translation_rows(cues: list[dict], rows: Any, speaker_count: int = 1) -> list[dict]:
     if not isinstance(rows, list):
         raise ValueError("Kết quả không phải JSON array")
     by_id = {int(row["id"]): row for row in rows if isinstance(row, dict)}
     expected_ids = {int(cue["id"]) for cue in cues}
     if len(by_id) != len(rows) or set(by_id) != expected_ids:
         raise ValueError("Gemini đã thay đổi danh sách id")
+    allowed_speakers = {f"S{index}" for index in range(1, max(1, min(4, int(speaker_count))) + 1)}
     for cue in cues:
         row = by_id[int(cue["id"])]
         corrected = str(row["original_corrected"]).strip()
@@ -195,7 +196,8 @@ def _apply_translation_rows(cues: list[dict], rows: Any) -> list[dict]:
             raise ValueError("Transcript hoặc bản dịch trống")
         cue["original_corrected"] = corrected
         cue["text_vi"] = translated
-        cue["speaker"] = re.sub(r"[^A-Za-z0-9_-]", "", str(row.get("speaker", "S1")))[:20] or "S1"
+        speaker = re.sub(r"[^A-Za-z0-9_-]", "", str(row.get("speaker", "S1"))).upper()[:20] or "S1"
+        cue["speaker"] = speaker if speaker in allowed_speakers else "S1"
         gender = str(row.get("gender", "unknown")).lower()
         cue["gender"] = gender if gender in {"male", "female", "unknown"} else "unknown"
         confidence = float(row["confidence"])
@@ -217,20 +219,29 @@ def _translation_cue_payload(cue: dict) -> dict:
     }
 
 
-def _translation_prompt(cues: list[dict]) -> str:
+def _translation_prompt(cues: list[dict], speaker_count: int = 1) -> str:
+    speaker_count = max(1, min(4, int(speaker_count)))
+    if speaker_count == 1:
+        speaker_instruction = "Video dùng một giọng duy nhất: bắt buộc đặt speaker S1 cho mọi cue. "
+    else:
+        allowed = ", ".join(f"S{index}" for index in range(1, speaker_count + 1))
+        speaker_instruction = (
+            f"Video có tối đa {speaker_count} vai nói. Chỉ dùng speaker trong {allowed}; "
+            "giữ cùng một speaker cho cùng một nhân vật/góc nhìn xuyên suốt video. "
+        )
     return (
         "Dựa trên whisper_transcript tiếng Trung, sửa lỗi nhận dạng rồi viết lại thành bản dịch tiếng Việt chính xác, tự nhiên. "
         "Chỉ dùng nội dung trong transcript; tuyệt đối không sáng tác, suy diễn hoặc thêm kiến thức ngoài lời nói. "
         "original_corrected phải là transcript tiếng Trung đã sửa. Mọi id, start_seconds, end_seconds và "
         "duration_seconds là bất biến: không bỏ, thêm, gộp, tách hoặc đổi thời gian cue. text_vi phải đủ nghĩa, "
         "viết hoa kiểu câu bình thường và hướng tới target_vi_characters để đọc vừa thời lượng gốc; chỉ rút gọn cách diễn đạt, "
-        "không được làm mất chủ thể, hành động, con số hay sự kiện chính. Dùng speaker S1 và gender unknown nếu transcript "
-        "không có bằng chứng rõ ràng về người nói khác. Dữ liệu cue: " +
+        "không được làm mất chủ thể, hành động, con số hay sự kiện chính. " + speaker_instruction +
+        "Dùng gender unknown nếu transcript không có bằng chứng rõ ràng về giới tính người nói. Dữ liệu cue: " +
         json.dumps([_translation_cue_payload(cue) for cue in cues], ensure_ascii=False)
     )
 
 
-def gemini_translate(cues: list[dict], api_key: str) -> list[dict]:
+def gemini_translate(cues: list[dict], api_key: str, speaker_count: int = 1) -> list[dict]:
     try:
         from google import genai
         from google.genai import types
@@ -243,7 +254,7 @@ def gemini_translate(cues: list[dict], api_key: str) -> list[dict]:
         )
         response = client.models.generate_content(
             model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
-            contents=_translation_prompt(cues),
+            contents=_translation_prompt(cues, speaker_count),
             config=types.GenerateContentConfig(
                 response_mime_type="application/json", response_json_schema=_translation_schema(), temperature=.1,
             ),
@@ -256,7 +267,7 @@ def gemini_translate(cues: list[dict], api_key: str) -> list[dict]:
         raise PipelineError("GEMINI_FAILED", f"Gemini không xử lý được transcript: {error}") from error
     try:
         rows = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I))
-        return _apply_translation_rows(cues, rows)
+        return _apply_translation_rows(cues, rows, speaker_count)
     except Exception as error:
         raise PipelineError("GEMINI_RESPONSE_INVALID", f"Gemini trả JSON không hợp lệ: {error}") from error
 
@@ -481,7 +492,7 @@ def analyze_job(job: dict, _voices: dict) -> None:
     update(job, 24, "Whisper đang nhận diện lời thoại…")
     cues = transcribe(audio)
     update(job, 36, "Gemini đang sửa lời thoại và viết lại tiếng Việt theo thời gian gốc…")
-    cues = gemini_translate(cues, job.pop("gemini_key"))
+    cues = gemini_translate(cues, job.pop("gemini_key"), job.get("voice_count", 1))
     regions = []
     if job["blur_mode"] == "auto":
         update(job, 46, "Đang tự tìm subtitle gốc và watermark xanh…")
@@ -786,29 +797,22 @@ def separate_background(job: dict) -> Path:
     if cached and Path(cached).exists():
         return Path(cached)
     output = job["work_dir"] / "separated"
-    update(job, 79, "Đang tách nhạc nền và giữ nhỏ giọng gốc…")
+    update(job, 79, "Đang tách nhạc nền và loại bỏ giọng gốc…")
     result = subprocess.run([sys.executable, "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs", "-o", str(output), str(job["source"])], capture_output=True, text=True)
     music_candidates = list(output.glob("**/no_vocals.wav"))
-    vocal_candidates = list(output.glob("**/vocals.wav"))
     music = music_candidates[0] if music_candidates else None
-    vocals = vocal_candidates[0] if vocal_candidates else None
-    if result.returncode or music is None or vocals is None:
+    if result.returncode or music is None:
         fallback = job["work_dir"] / "background.wav"
-        run([ffmpeg(), "-y", "-i", str(job["source"]), "-vn", "-af", "volume=0.16", str(fallback)], "AUDIO_SEPARATION_FAILED")
-        job["warning"] = "Demucs không tách được vocal; đã giữ toàn bộ audio gốc ở mức nhỏ."
+        duration = max(.1, float(job.get("duration", 1)))
+        run([
+            ffmpeg(), "-y", "-f", "lavfi", "-i", "anullsrc",
+            "-t", f"{duration:.3f}", "-ar", "44100", "-ac", "2", str(fallback),
+        ], "AUDIO_SEPARATION_FAILED")
+        job["warning"] = "Demucs không tách được nhạc nền; bản xuất dùng nền im lặng để không giữ giọng gốc."
         job["background"] = fallback
         return fallback
-    background = job["work_dir"] / "background-with-original-voice.wav"
-    bed_filter = (
-        "[0:a]volume=1.0[music];[1:a]volume=0.12[voice];"
-        "[music][voice]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=.95[bed]"
-    )
-    run([
-        ffmpeg(), "-y", "-i", str(music), "-i", str(vocals),
-        "-filter_complex", bed_filter, "-map", "[bed]", "-ar", "44100", "-ac", "2", str(background),
-    ], "AUDIO_SEPARATION_FAILED")
-    job["background"] = background
-    return background
+    job["background"] = music
+    return music
 
 
 def ass_time(value: float) -> str:

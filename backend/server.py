@@ -27,7 +27,7 @@ JOBS: dict[str, dict] = {}
 VOICES: dict[str, dict] = {}
 LOCK = threading.RLock()
 
-app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.4.5", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.5.0", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
@@ -78,7 +78,7 @@ def run_render(job_id: str, request: RenderRequest) -> None:
 @app.get("/api/health", dependencies=[Depends(authorize)])
 def health() -> dict:
     return {
-        "ok": True, "apiVersion": "1.4.5",
+        "ok": True, "apiVersion": "1.5.0",
         "immutableReviews": True,
         "voices": [
             {"id": "edge:vi-VN-HoaiMyNeural", "name": "Hoài My · Nữ"},
@@ -99,6 +99,7 @@ def create_analysis(request: AnalyzeRequest) -> dict:
             "id": job_id, "status": "queued", "progress": 1, "message": "Đang bắt đầu phân tích trên Colab…",
             "canonical_url": request.canonicalUrl, "cookie_text": request.cookieText,
             "gemini_key": request.geminiApiKey, "blur_mode": request.blurMode,
+            "voice_count": request.voiceCount,
             "work_dir": work_dir, "cancelled": False,
         }
     EXECUTOR.submit(run_analysis, job_id)
