@@ -2,7 +2,7 @@ import { CanvasEditor } from "./canvas-editor.js";
 import { cookieSummary, deleteClone, listClones, saveClone } from "./storage.js";
 
 const $ = (selector) => document.querySelector(selector);
-const EXPECTED_API_VERSION = "1.5.0";
+const EXPECTED_API_VERSION = "1.5.1";
 const pageParams = new URLSearchParams(location.search);
 const isManualEditorPage = pageParams.get("manualEditor") === "1";
 const isReviewPlayerPage = pageParams.get("reviewPlayer") === "1";
@@ -182,6 +182,7 @@ function friendlyError(error) {
     JOB_NOT_FOUND: "Runtime Colab đã khởi động lại nên job cũ không còn. Hãy chạy lại video.",
     NO_SPEECH: "Video không có lời thoại để lồng tiếng.",
     GEMINI_RESPONSE_INVALID: "Gemini trả kết quả không hợp lệ. Hãy thử lại.",
+    INVALID_VOICE_MAP: `Hãy chọn đúng ${state.voiceCount} giọng khác nhau.`,
     STALE_RUNTIME: "Colab đang chạy backend cũ. Extension đang khởi động lại phiên mới…",
   };
   return messages[errorCode(error)] || error?.message || error?.detail?.message || String(error || "Có lỗi xảy ra.");
@@ -285,6 +286,14 @@ function collectVoiceSelections() {
   return selections;
 }
 
+function validateVoiceSelections() {
+  const selections = collectVoiceSelections();
+  if (new Set(Object.values(selections)).size !== state.voiceCount) {
+    return { code: "INVALID_VOICE_MAP", message: `Hãy chọn đúng ${state.voiceCount} giọng khác nhau.` };
+  }
+  return null;
+}
+
 function rememberVoiceSelections() {
   const current = collectVoiceSelections();
   if (current["*"]) state.voiceSelections.S1 = current["*"];
@@ -311,7 +320,7 @@ function rebuildVoiceSlots() {
   }
   $("#voice-help").textContent = state.voiceCount === 1
     ? "Một giọng duy nhất sẽ được dùng cho mọi nhân vật trong video."
-    : `Gán giọng cho ${state.voiceCount} vai nói. AI giữ cùng một mã nhân vật xuyên suốt các câu.`;
+    : `Chọn ${state.voiceCount} giọng khác nhau. AI chỉ phân vai trong đúng ${state.voiceCount} nhân vật này.`;
 }
 
 async function storePending(action) {
@@ -399,7 +408,7 @@ async function ensureServer(action) {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.0 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.1 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
@@ -427,6 +436,8 @@ async function analyze() {
   }
   const cookie = cookieSummary(saved.douyinCookies);
   if (!cookie.valid) { setBusy(false); setStatus(cookie.label); return; }
+  const voiceError = validateVoiceSelections();
+  if (voiceError) { setBusy(false); setStatus(friendlyError(voiceError)); return; }
   state.previewRate = null;
   $("#review-video").pause();
   $("#review-video").hidden = true;
@@ -566,6 +577,8 @@ async function render(previewOnly) {
       blurRegions = state.renderConfig.blurRegions.map((rect) => ({ ...rect }));
       subtitleRect = { ...state.renderConfig.subtitleRect };
     } else {
+      const voiceError = validateVoiceSelections();
+      if (voiceError) throw voiceError;
       selections = collectVoiceSelections();
       const cloneIds = [...new Set(Object.values(selections).filter((value) => value.startsWith("clone:")).map((value) => value.slice(6)))];
       for (const id of cloneIds) {
@@ -695,7 +708,7 @@ async function initialize() {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.0 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.1 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));

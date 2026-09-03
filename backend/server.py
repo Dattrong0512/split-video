@@ -27,7 +27,7 @@ JOBS: dict[str, dict] = {}
 VOICES: dict[str, dict] = {}
 LOCK = threading.RLock()
 
-app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.5.0", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.5.1", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
@@ -78,7 +78,7 @@ def run_render(job_id: str, request: RenderRequest) -> None:
 @app.get("/api/health", dependencies=[Depends(authorize)])
 def health() -> dict:
     return {
-        "ok": True, "apiVersion": "1.5.0",
+        "ok": True, "apiVersion": "1.5.1",
         "immutableReviews": True,
         "voices": [
             {"id": "edge:vi-VN-HoaiMyNeural", "name": "Hoài My · Nữ"},
@@ -148,6 +148,13 @@ def start_render(job_id: str, request: RenderRequest) -> dict:
         raise HTTPException(status_code=404, detail={"code": "JOB_NOT_FOUND", "message": "Không tìm thấy job."})
     if job["status"] not in {"analysis_ready", "preview_ready"}:
         raise HTTPException(status_code=409, detail={"code": "JOB_NOT_READY", "message": "Job chưa phân tích xong."})
+    voice_count = max(1, min(4, int(job.get("voice_count", 1))))
+    expected_speakers = {"*"} if voice_count == 1 else {f"S{index}" for index in range(1, voice_count + 1)}
+    if set(request.voiceMap) != expected_speakers or len(set(request.voiceMap.values())) != voice_count:
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_VOICE_MAP",
+            "message": f"Cấu hình phải có đúng {voice_count} giọng khác nhau.",
+        })
     if request.previewOnly:
         job.update(status="queued_preview", message="Đang chuẩn bị bản xem trước 30 giây…", progress=56)
     else:

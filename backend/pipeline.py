@@ -26,7 +26,7 @@ class PipelineError(RuntimeError):
 _whisper_model = None
 _omnivoice_model = None
 _ocr_model = None
-TTS_CACHE_VERSION = 4
+TTS_CACHE_VERSION = 5
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
@@ -162,20 +162,24 @@ def transcribe(audio: Path) -> list[dict]:
     return cues
 
 
-def _translation_schema() -> dict:
+def _translation_schema(speaker_count: int = 1) -> dict:
+    speaker_count = max(1, min(4, int(speaker_count)))
+    properties = {
+        "id": {"type": "integer"},
+        "original_corrected": {"type": "string"},
+        "text_vi": {"type": "string"},
+        "confidence": {"type": "number"},
+    }
+    required = ["id", "original_corrected", "text_vi", "confidence"]
+    if speaker_count > 1:
+        properties.update({"speaker": {"type": "string"}, "gender": {"type": "string"}})
+        required.extend(["speaker", "gender"])
     return {
         "type": "array",
         "items": {
             "type": "object",
-            "properties": {
-                "id": {"type": "integer"},
-                "original_corrected": {"type": "string"},
-                "text_vi": {"type": "string"},
-                "speaker": {"type": "string"},
-                "gender": {"type": "string"},
-                "confidence": {"type": "number"},
-            },
-            "required": ["id", "original_corrected", "text_vi", "speaker", "gender", "confidence"],
+            "properties": properties,
+            "required": required,
         },
     }
 
@@ -187,7 +191,8 @@ def _apply_translation_rows(cues: list[dict], rows: Any, speaker_count: int = 1)
     expected_ids = {int(cue["id"]) for cue in cues}
     if len(by_id) != len(rows) or set(by_id) != expected_ids:
         raise ValueError("Gemini đã thay đổi danh sách id")
-    allowed_speakers = {f"S{index}" for index in range(1, max(1, min(4, int(speaker_count))) + 1)}
+    speaker_count = max(1, min(4, int(speaker_count)))
+    allowed_speakers = {f"S{index}" for index in range(1, speaker_count + 1)}
     for cue in cues:
         row = by_id[int(cue["id"])]
         corrected = str(row["original_corrected"]).strip()
@@ -196,14 +201,20 @@ def _apply_translation_rows(cues: list[dict], rows: Any, speaker_count: int = 1)
             raise ValueError("Transcript hoặc bản dịch trống")
         cue["original_corrected"] = corrected
         cue["text_vi"] = translated
-        speaker = re.sub(r"[^A-Za-z0-9_-]", "", str(row.get("speaker", "S1"))).upper()[:20] or "S1"
-        cue["speaker"] = speaker if speaker in allowed_speakers else "S1"
-        gender = str(row.get("gender", "unknown")).lower()
-        cue["gender"] = gender if gender in {"male", "female", "unknown"} else "unknown"
+        if speaker_count == 1:
+            cue["speaker"] = "S1"
+            cue["gender"] = "unknown"
+        else:
+            speaker = re.sub(r"[^A-Za-z0-9_-]", "", str(row.get("speaker", "S1"))).upper()[:20] or "S1"
+            cue["speaker"] = speaker if speaker in allowed_speakers else "S1"
+            gender = str(row.get("gender", "unknown")).lower()
+            cue["gender"] = gender if gender in {"male", "female", "unknown"} else "unknown"
         confidence = float(row["confidence"])
         if not 0 <= confidence <= 1:
             raise ValueError("Độ tin cậy nằm ngoài khoảng 0–1")
         cue["confidence"] = confidence
+    if speaker_count > 1 and {cue["speaker"] for cue in cues} != allowed_speakers:
+        raise ValueError(f"Gemini không dùng đủ đúng {speaker_count} vai nói")
     return cues
 
 
@@ -222,12 +233,13 @@ def _translation_cue_payload(cue: dict) -> dict:
 def _translation_prompt(cues: list[dict], speaker_count: int = 1) -> str:
     speaker_count = max(1, min(4, int(speaker_count)))
     if speaker_count == 1:
-        speaker_instruction = "Video dùng một giọng duy nhất: bắt buộc đặt speaker S1 cho mọi cue. "
+        speaker_instruction = "Chỉ sửa transcript và viết lại phụ đề; không phân vai, không suy đoán nhân vật hay giới tính. "
     else:
         allowed = ", ".join(f"S{index}" for index in range(1, speaker_count + 1))
         speaker_instruction = (
-            f"Video có tối đa {speaker_count} vai nói. Chỉ dùng speaker trong {allowed}; "
+            f"Phải phân thành đúng {speaker_count} vai nói bằng các mã {allowed}; không dùng mã khác. "
             "giữ cùng một speaker cho cùng một nhân vật/góc nhìn xuyên suốt video. "
+            "Dùng gender unknown nếu transcript không có bằng chứng rõ ràng về giới tính người nói. "
         )
     return (
         "Dựa trên whisper_transcript tiếng Trung, sửa lỗi nhận dạng rồi viết lại thành bản dịch tiếng Việt chính xác, tự nhiên. "
@@ -235,8 +247,7 @@ def _translation_prompt(cues: list[dict], speaker_count: int = 1) -> str:
         "original_corrected phải là transcript tiếng Trung đã sửa. Mọi id, start_seconds, end_seconds và "
         "duration_seconds là bất biến: không bỏ, thêm, gộp, tách hoặc đổi thời gian cue. text_vi phải đủ nghĩa, "
         "viết hoa kiểu câu bình thường và hướng tới target_vi_characters để đọc vừa thời lượng gốc; chỉ rút gọn cách diễn đạt, "
-        "không được làm mất chủ thể, hành động, con số hay sự kiện chính. " + speaker_instruction +
-        "Dùng gender unknown nếu transcript không có bằng chứng rõ ràng về giới tính người nói. Dữ liệu cue: " +
+        "không được làm mất chủ thể, hành động, con số hay sự kiện chính. " + speaker_instruction + "Dữ liệu cue: " +
         json.dumps([_translation_cue_payload(cue) for cue in cues], ensure_ascii=False)
     )
 
@@ -252,24 +263,34 @@ def gemini_translate(cues: list[dict], api_key: str, speaker_count: int = 1) -> 
                 retry_options=types.HttpRetryOptions(**_gemini_retry_options()),
             ),
         )
-        response = client.models.generate_content(
-            model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
-            contents=_translation_prompt(cues, speaker_count),
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json", response_json_schema=_translation_schema(), temperature=.1,
-            ),
-        )
-        text = response.text or ""
     except Exception as error:
         value = str(error).lower()
         if "api key" in value or "401" in value or "403" in value:
             raise PipelineError("INVALID_GEMINI_KEY", "Gemini API key không hợp lệ hoặc đã bị khóa.") from error
         raise PipelineError("GEMINI_FAILED", f"Gemini không xử lý được transcript: {error}") from error
-    try:
-        rows = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I))
-        return _apply_translation_rows(cues, rows, speaker_count)
-    except Exception as error:
-        raise PipelineError("GEMINI_RESPONSE_INVALID", f"Gemini trả JSON không hợp lệ: {error}") from error
+    validation_error = None
+    for _attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+                contents=_translation_prompt(cues, speaker_count),
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_json_schema=_translation_schema(speaker_count), temperature=.1,
+                ),
+            )
+        except Exception as error:
+            value = str(error).lower()
+            if "api key" in value or "401" in value or "403" in value:
+                raise PipelineError("INVALID_GEMINI_KEY", "Gemini API key không hợp lệ hoặc đã bị khóa.") from error
+            raise PipelineError("GEMINI_FAILED", f"Gemini không xử lý được transcript: {error}") from error
+        try:
+            text = response.text or ""
+            rows = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I))
+            return _apply_translation_rows(cues, rows, speaker_count)
+        except Exception as error:
+            validation_error = error
+    raise PipelineError("GEMINI_RESPONSE_INVALID", f"Gemini không giữ đúng cấu hình vai nói: {validation_error}") from validation_error
 
 
 def _iou(a: dict, b: dict) -> float:
@@ -663,8 +684,10 @@ def synthesize_verified_clone(
         if best_path is not None and best_score >= .75:
             shutil.copyfile(best_path, raw)
             return best_score, False
-        synthesize_cue(text, "edge:vi-VN-HoaiMyNeural", raw, voices)
-        return best_score, True
+        raise PipelineError(
+            "VOICE_FAILED",
+            f"Giọng clone đã chọn không đọc đúng cue sau {attempts} lần thử (score {best_score:.2f}); không tự đổi sang giọng khác.",
+        )
     finally:
         for candidate in candidates:
             candidate.unlink(missing_ok=True)
@@ -744,7 +767,9 @@ def create_dubbing(job: dict, request, voices: dict, duration_limit: float | Non
     generated_files = []
     generated_durations = []
     for index, cue in enumerate(cues, 1):
-        voice = request.voiceMap.get(cue["speaker"]) or request.voiceMap.get("*") or "edge:vi-VN-HoaiMyNeural"
+        voice = request.voiceMap.get(cue["speaker"]) or request.voiceMap.get("*")
+        if not voice:
+            raise PipelineError("INVALID_VOICE_MAP", f"Không có giọng được chọn cho {cue['speaker']}.")
         cache_key = str(cue["id"])
         cached = cache.get(cache_key, {})
         raw = directory / f"raw-{int(cue['id']):04d}.wav"
@@ -753,14 +778,9 @@ def create_dubbing(job: dict, request, voices: dict, duration_limit: float | Non
             update(job, 62 + index / max(1, total) * 12, f"Đang tạo giọng Việt {index}/{total} ({cue['speaker']})…")
             cue_duration = max(.35, float(cue["end"]) - float(cue["start"]))
             if voice.startswith("clone:"):
-                score, used_fallback = synthesize_verified_clone(
+                synthesize_verified_clone(
                     cue["text_vi"], voice, raw, voices, cue_duration,
                 )
-                if used_fallback:
-                    job.setdefault("warnings", []).append(
-                        f"Cue {cue['id']} của voice clone không đọc đúng văn bản (score {score:.2f}); "
-                        "đã dùng giọng Việt sạch để tránh lặp từ."
-                    )
             else:
                 synthesize_cue(cue["text_vi"], voice, raw, voices, target_duration=cue_duration)
             cache[cache_key] = {

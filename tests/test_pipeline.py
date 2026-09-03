@@ -131,13 +131,14 @@ class PipelineHelpersTest(unittest.TestCase):
             {"id": 1, "start": 1, "end": 2, "original": "再见"},
         ]
         rows = [
-            {"id": 0, "original_corrected": "你好", "text_vi": "Xin chào.", "speaker": "S1", "gender": "female", "confidence": .9},
-            {"id": 1, "original_corrected": "再见", "text_vi": "Tạm biệt.", "speaker": "S2", "gender": "male", "confidence": .9},
+            {"id": 0, "original_corrected": "你好", "text_vi": "Xin chào.", "confidence": .9},
+            {"id": 1, "original_corrected": "再见", "text_vi": "Tạm biệt.", "confidence": .9},
         ]
 
         translated = _apply_translation_rows(cues, rows, speaker_count=1)
 
         self.assertEqual([cue["speaker"] for cue in translated], ["S1", "S1"])
+        self.assertEqual([cue["gender"] for cue in translated], ["unknown", "unknown"])
 
     def test_multi_voice_mode_restricts_speakers_to_selected_slots(self):
         cues = [
@@ -178,6 +179,25 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertNotIn("maxItems", schema)
         self.assertNotIn("additionalProperties", schema["items"])
         self.assertEqual(schema["items"]["properties"]["confidence"], {"type": "number"})
+
+    def test_one_voice_translation_schema_and_prompt_do_not_ask_gemini_to_cast(self):
+        schema = _translation_schema(1)
+        properties = schema["items"]["properties"]
+        prompt = _translation_prompt([{"id": 0, "start": 0, "end": 1, "original": "你好"}], 1)
+
+        self.assertNotIn("speaker", properties)
+        self.assertNotIn("gender", properties)
+        self.assertNotIn("speaker", prompt.lower())
+        self.assertNotIn("gender", prompt.lower())
+        self.assertIn("chỉ sửa transcript và viết lại phụ đề", prompt.lower())
+
+    def test_two_voice_translation_requires_exactly_two_cast_slots(self):
+        schema = _translation_schema(2)
+        prompt = _translation_prompt([{"id": 0, "start": 0, "end": 1, "original": "你好"}], 2)
+
+        self.assertIn("speaker", schema["items"]["properties"])
+        self.assertIn("S1, S2", prompt)
+        self.assertIn("đúng 2 vai nói", prompt)
 
     def test_translation_rows_reject_changed_ids(self):
         with self.assertRaises(ValueError):
@@ -269,22 +289,23 @@ class PipelineHelpersTest(unittest.TestCase):
         text = "Tôi không biết tại sao."
         self.assertEqual(tts_text_score(text, text), 1.0)
 
-    def test_bad_clone_attempts_fall_back_instead_of_shipping_repeated_words(self):
+    def test_bad_clone_attempts_fail_instead_of_switching_to_another_voice(self):
         with TemporaryDirectory() as directory:
             raw = Path(directory) / "raw.wav"
+            attempted_voices = []
 
             def fake_synthesize(_text, voice, path, _voices, target_duration=None):
-                path.write_bytes(b"edge" if voice.startswith("edge:") else b"clone")
+                attempted_voices.append(voice)
+                path.write_bytes(b"clone")
 
             with patch("backend.pipeline.synthesize_cue", side_effect=fake_synthesize), \
                     patch("backend.pipeline.trim_repeated_tts_tail", return_value=False), \
                     patch("backend.pipeline.tts_transcript_score", side_effect=[.31, .44, .38]):
-                score, fallback = synthesize_verified_clone(
-                    "Đây là câu đúng.", "clone:test", raw, {}, 1.2,
-                )
-            self.assertTrue(fallback)
-            self.assertAlmostEqual(score, .44)
-            self.assertEqual(raw.read_bytes(), b"edge")
+                with self.assertRaises(PipelineError) as raised:
+                    synthesize_verified_clone("Đây là câu đúng.", "clone:test", raw, {}, 1.2)
+
+            self.assertEqual(raised.exception.code, "VOICE_FAILED")
+            self.assertEqual(attempted_voices, ["clone:test"] * 3)
 
     def test_verified_clone_is_used_without_fallback(self):
         with TemporaryDirectory() as directory:

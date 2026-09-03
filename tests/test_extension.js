@@ -97,7 +97,7 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   let tabUpdatedListener;
   const event = () => ({ addListener: () => {} });
   const context = {
-    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.0" }) }),
+    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.1" }) }),
     AbortSignal: { timeout: () => ({}) },
     setTimeout: (callback) => { callback(); return 1; },
     chrome: {
@@ -220,6 +220,8 @@ Promise.all([
     assert.match(sidepanel, /voiceCount: state\.voiceCount/);
     assert.match(sidepanel, /return \{ "\*": \$\("#default-voice"\)\.value \}/);
     assert.match(sidepanel, /selections\[`S\$\{index\}`\]/);
+    assert.match(sidepanel, /new Set\(Object\.values\(selections\)\)\.size !== state\.voiceCount/);
+    assert.match(sidepanel, /INVALID_VOICE_MAP/);
     assert.match(html, /id="review-video"/);
     assert.match(html, /id="open-large-review"/);
     assert.match(sidepanel, /\/preview-token/);

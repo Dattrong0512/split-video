@@ -26,7 +26,7 @@ class ServerContractTest(unittest.TestCase):
     def test_health_lists_vietnamese_presets(self):
         response = self.client.get("/api/health", headers=self.auth)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["apiVersion"], "1.5.0")
+        self.assertEqual(response.json()["apiVersion"], "1.5.1")
         self.assertTrue(response.json()["immutableReviews"])
         self.assertEqual([voice["id"] for voice in response.json()["voices"]], [
             "edge:vi-VN-HoaiMyNeural", "edge:vi-VN-NamMinhNeural"
@@ -175,6 +175,54 @@ class ServerContractTest(unittest.TestCase):
                 self.assertTrue(submit.call_args.args[2].previewOnly)
             finally:
                 server.JOBS.pop(job_id, None)
+
+    def test_render_rejects_more_or_fewer_voices_than_the_analysis_configuration(self):
+        job_id = "voice-count-contract-test"
+        server.JOBS[job_id] = {"id": job_id, "status": "analysis_ready", "voice_count": 1}
+        body = {
+            "voiceMap": {"S1": "edge:vi-VN-HoaiMyNeural", "S2": "edge:vi-VN-NamMinhNeural"},
+            "blurRegions": [], "subtitleRect": {"x": .1, "y": .7, "w": .8, "h": .2},
+            "previewOnly": True,
+        }
+        try:
+            with patch.object(server.EXECUTOR, "submit"):
+                response = self.client.post(f"/api/jobs/{job_id}/render", headers=self.auth, json=body)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["detail"]["code"], "INVALID_VOICE_MAP")
+        finally:
+            server.JOBS.pop(job_id, None)
+
+    def test_render_rejects_duplicate_voices_when_two_are_configured(self):
+        job_id = "distinct-voice-contract-test"
+        server.JOBS[job_id] = {"id": job_id, "status": "analysis_ready", "voice_count": 2}
+        body = {
+            "voiceMap": {"S1": "edge:vi-VN-HoaiMyNeural", "S2": "edge:vi-VN-HoaiMyNeural"},
+            "blurRegions": [], "subtitleRect": {"x": .1, "y": .7, "w": .8, "h": .2},
+            "previewOnly": True,
+        }
+        try:
+            with patch.object(server.EXECUTOR, "submit"):
+                response = self.client.post(f"/api/jobs/{job_id}/render", headers=self.auth, json=body)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["detail"]["code"], "INVALID_VOICE_MAP")
+        finally:
+            server.JOBS.pop(job_id, None)
+
+    def test_render_accepts_exactly_two_distinct_voices_when_two_are_configured(self):
+        job_id = "valid-distinct-voice-contract-test"
+        server.JOBS[job_id] = {"id": job_id, "status": "analysis_ready", "voice_count": 2}
+        body = {
+            "voiceMap": {"S1": "edge:vi-VN-HoaiMyNeural", "S2": "edge:vi-VN-NamMinhNeural"},
+            "blurRegions": [], "subtitleRect": {"x": .1, "y": .7, "w": .8, "h": .2},
+            "previewOnly": True,
+        }
+        try:
+            with patch.object(server.EXECUTOR, "submit") as submit:
+                response = self.client.post(f"/api/jobs/{job_id}/render", headers=self.auth, json=body)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(submit.call_args.args[2].voiceMap, body["voiceMap"])
+        finally:
+            server.JOBS.pop(job_id, None)
 
 
 if __name__ == "__main__":

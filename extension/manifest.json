@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Douyin Vietnamese Dubbing",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Tải video Douyin đang xem, làm mờ chữ gốc, tạo phụ đề và lồng tiếng Việt.",
   "minimum_chrome_version": "116",
   "permissions": ["scripting", "storage", "downloads", "sidePanel"],
