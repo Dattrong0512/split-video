@@ -26,7 +26,7 @@ class PipelineError(RuntimeError):
 _whisper_model = None
 _omnivoice_model = None
 _ocr_model = None
-TTS_CACHE_VERSION = 6
+TTS_CACHE_VERSION = 7
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
@@ -215,6 +215,16 @@ def _apply_translation_rows(cues: list[dict], rows: Any, speaker_count: int = 1)
         translated = str(row["text_vi"]).strip()
         if not corrected or not translated:
             raise ValueError("Transcript hoặc bản dịch trống")
+        group_duration = float(grouped_sources[-1]["end"]) - float(grouped_sources[0]["start"])
+        if group_duration > 4.8:
+            raise ValueError("Một subtitle không được vượt quá 4,8 giây thời lượng lời nói")
+        sentence_endings = re.findall(r"(?:[!?。？！]+|(?<!\d)\.)(?=\s|$)", translated)
+        if len(sentence_endings) > 1:
+            raise ValueError("Mỗi subtitle chỉ được chứa một câu nói hoàn chỉnh")
+        normalized_translation = " ".join(translated.split())
+        max_characters = max(28, min(56, round(group_duration * 18)))
+        if len(normalized_translation) > max_characters:
+            raise ValueError(f"Subtitle quá dài ({len(normalized_translation)}/{max_characters} ký tự)")
         cue = {
             "id": source_ids[0], "source_ids": source_ids,
             "start": float(grouped_sources[0]["start"]), "end": float(grouped_sources[-1]["end"]),
@@ -268,7 +278,8 @@ def _translation_prompt(cues: list[dict], speaker_count: int = 1) -> str:
         "Chỉ dùng nội dung trong transcript; tuyệt đối không sáng tác, suy diễn hoặc thêm kiến thức ngoài lời nói. "
         "Được gộp các cue liền kề thành một câu nói hoàn chỉnh theo ngữ nghĩa và dấu câu, thay vì coi mỗi ranh giới Whisper "
         "là hết câu. Mỗi output phải có source_ids chứa các id liền kề; toàn bộ id đầu vào phải xuất hiện đúng một lần, "
-        "đúng thứ tự. Không gộp qua khoảng im lặng dài hoặc giữa hai người nói. original_corrected phải là transcript "
+        "đúng thứ tự. Mỗi output chỉ chứa một câu, tối đa 4,8 giây, tối đa 56 ký tự tiếng Việt và không gộp nhiều lượt "
+        "đối thoại. Không gộp qua khoảng im lặng dài hoặc giữa hai người nói. original_corrected phải là transcript "
         "tiếng Trung đã sửa của cả nhóm. text_vi phải đủ câu, đủ nghĩa, viết hoa kiểu câu bình thường và hướng tới tổng "
         "target_vi_characters của các source_ids để đọc vừa toàn bộ thời lượng nhóm; chỉ rút gọn cách diễn đạt, "
         "không được làm mất chủ thể, hành động, con số hay sự kiện chính. " + speaker_instruction + "Dữ liệu cue: " +
@@ -669,6 +680,9 @@ def tts_text_score(expected_text: str, recognized_text: str) -> float:
     if _repetition_penalty(expected, recognized):
         return min(score, .35)
 
+    last_expected_match_end = max((block.a + block.size for block in blocks), default=0)
+    if len(expected) - last_expected_match_end >= 2:
+        return min(score, .4)
     last_match_end = max((block.b + block.size for block in blocks), default=0)
     if len(recognized) - last_match_end >= 2:
         return min(score, .4)
@@ -703,9 +717,9 @@ def synthesize_verified_clone(
             score = tts_transcript_score(candidate, text)
             if score > best_score:
                 best_path, best_score = candidate, score
-            if score >= .82:
+            if score >= .86:
                 break
-        if best_path is not None and best_score >= .75:
+        if best_path is not None and best_score >= .86:
             shutil.copyfile(best_path, raw)
             return best_score, False
         raise PipelineError(

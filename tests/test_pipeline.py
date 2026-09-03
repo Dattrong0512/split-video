@@ -195,6 +195,44 @@ class PipelineHelpersTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _apply_translation_rows(cues, rows, speaker_count=1)
 
+    def test_translation_rejects_a_multi_sentence_group_that_would_fill_the_screen(self):
+        cues = [
+            {"id": 0, "start": 0, "end": 1.2, "original": "老板我想吃螺蛳粉"},
+            {"id": 1, "start": 1.2, "end": 2.5, "original": "可以你能请我吃吗"},
+            {"id": 2, "start": 2.5, "end": 4.0, "original": "我还没说条件呢"},
+        ]
+        rows = [{
+            "source_ids": [0, 1, 2], "original_corrected": "老板，我想吃螺蛳粉。可以，你能请我吃吗？我还没说条件呢。",
+            "text_vi": "Ông chủ, tôi muốn ăn bún ốc. Được, bạn có thể mời tôi ăn không? Tôi còn chưa nói điều kiện.",
+            "confidence": .9,
+        }]
+
+        with self.assertRaisesRegex(ValueError, "một câu"):
+            _apply_translation_rows(cues, rows, speaker_count=1)
+
+    def test_translation_rejects_a_group_longer_than_one_subtitle_window(self):
+        cues = [
+            {"id": 0, "start": 0, "end": 3, "original": "第一部分"},
+            {"id": 1, "start": 3, "end": 6, "original": "第二部分"},
+        ]
+        rows = [{
+            "source_ids": [0, 1], "original_corrected": "第一部分第二部分。", "text_vi": "Đây là một câu kéo dài quá lâu.", "confidence": .9,
+        }]
+
+        with self.assertRaisesRegex(ValueError, "thời lượng"):
+            _apply_translation_rows(cues, rows, speaker_count=1)
+
+    def test_translation_rejects_one_overlong_subtitle_sentence(self):
+        cues = [{"id": 0, "start": 0, "end": 3, "original": "一句很长的话"}]
+        rows = [{
+            "source_ids": [0], "original_corrected": "一句很长的话。",
+            "text_vi": "Một câu phụ đề dài liên tục chiếm quá nhiều dòng trên màn hình và không thể đọc kịp trong thời gian nói",
+            "confidence": .9,
+        }]
+
+        with self.assertRaisesRegex(ValueError, "quá dài"):
+            _apply_translation_rows(cues, rows, speaker_count=1)
+
     def test_translation_prompt_uses_only_whisper_not_audio_or_ocr(self):
         prompt = _translation_prompt([{
             "id": 2, "start": 1, "end": 2, "original": "只使用语音识别文字", "screen_text": "不要使用OCR",
@@ -336,6 +374,11 @@ class PipelineHelpersTest(unittest.TestCase):
         recognized = "Tôi không biết vì sao sao sao sao chuyện này lại xảy ra."
         self.assertLess(tts_text_score(expected, recognized), .68)
 
+    def test_transcript_gate_rejects_audio_missing_the_sentence_ending(self):
+        expected = "Ông chủ tôi muốn ăn bún ốc nhưng tôi vẫn chưa nói xong điều kiện."
+        recognized = "Ông chủ tôi muốn ăn bún ốc nhưng tôi vẫn chưa nói xong."
+        self.assertLess(tts_text_score(expected, recognized), .68)
+
     def test_transcript_gate_accepts_legitimate_repeated_word(self):
         text = "Ba ba ba đều là những người cha tốt."
         self.assertGreater(tts_text_score(text, text), .8)
@@ -361,6 +404,19 @@ class PipelineHelpersTest(unittest.TestCase):
 
             self.assertEqual(raised.exception.code, "VOICE_FAILED")
             self.assertEqual(attempted_voices, ["clone:test"] * 3)
+
+    def test_borderline_incomplete_clone_is_not_accepted(self):
+        with TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw.wav"
+
+            def fake_synthesize(_text, _voice, path, _voices, target_duration=None):
+                path.write_bytes(b"incomplete")
+
+            with patch("backend.pipeline.synthesize_cue", side_effect=fake_synthesize), \
+                    patch("backend.pipeline.trim_repeated_tts_tail", return_value=False), \
+                    patch("backend.pipeline.tts_transcript_score", side_effect=[.78, .80, .81]):
+                with self.assertRaises(PipelineError):
+                    synthesize_verified_clone("Câu này phải được đọc đầy đủ.", "clone:test", raw, {}, 2.0)
 
     def test_verified_clone_is_used_without_fallback(self):
         with TemporaryDirectory() as directory:

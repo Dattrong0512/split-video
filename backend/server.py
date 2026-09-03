@@ -27,7 +27,7 @@ JOBS: dict[str, dict] = {}
 VOICES: dict[str, dict] = {}
 LOCK = threading.RLock()
 
-app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.5.2", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.5.3", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
@@ -78,7 +78,7 @@ def run_render(job_id: str, request: RenderRequest) -> None:
 @app.get("/api/health", dependencies=[Depends(authorize)])
 def health() -> dict:
     return {
-        "ok": True, "apiVersion": "1.5.2",
+        "ok": True, "apiVersion": "1.5.3",
         "immutableReviews": True,
         "voices": [
             {"id": "edge:vi-VN-HoaiMyNeural", "name": "Hoài My · Nữ"},
