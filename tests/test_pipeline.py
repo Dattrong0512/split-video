@@ -1,16 +1,18 @@
-import unittest
+import json
 import shutil
 import subprocess
+import sys
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from backend.pipeline import (
     DEFAULT_GEMINI_MODEL, TTS_CACHE_VERSION, PipelineError, _apply_translation_rows, _atempo, _gemini_retry_options,
     _old_ocr_rows, _screen_subtitle_text, _translation_cue_payload, _translation_prompt, _translation_schema,
     _v3_ocr_boxes, _v3_ocr_rows, audio_mix_filter, cluster_rectangles, encoding_options, media_duration,
-    ensure_portrait_subtitle_blur, plan_dubbing_timeline, transcribe,
+    ensure_portrait_subtitle_blur, gemini_translate, plan_dubbing_timeline, transcribe,
     render_job, repeated_tts_tail_cutoff, separate_background, synthesize_cue, synthesize_verified_clone, tts_text_score,
     video_filter, write_ass,
 )
@@ -22,6 +24,47 @@ class PipelineHelpersTest(unittest.TestCase):
         retry = _gemini_retry_options()
         self.assertEqual(retry["attempts"], 6)
         self.assertIn(503, retry["http_status_codes"])
+
+    def test_gemini_validation_retry_explains_what_the_model_must_correct(self):
+        cues = [
+            {"id": 0, "start": 0, "end": 1, "original": "甲"},
+            {"id": 1, "start": 1, "end": 2, "original": "乙"},
+        ]
+        invalid = [
+            {"source_ids": [1], "original_corrected": "乙", "text_vi": "Hai.", "confidence": .9},
+            {"source_ids": [0], "original_corrected": "甲", "text_vi": "Một.", "confidence": .9},
+        ]
+        valid = [
+            {"source_ids": [0], "original_corrected": "甲", "text_vi": "Một.", "confidence": .9},
+            {"source_ids": [1], "original_corrected": "乙", "text_vi": "Hai.", "confidence": .9},
+        ]
+
+        class Models:
+            def __init__(self):
+                self.prompts = []
+
+            def generate_content(self, **kwargs):
+                self.prompts.append(kwargs["contents"])
+                repaired = "Lỗi cần sửa:" in kwargs["contents"]
+                return SimpleNamespace(text=json.dumps(valid if repaired else invalid))
+
+        models = Models()
+        google = ModuleType("google")
+        genai = ModuleType("google.genai")
+        genai.Client = lambda **_kwargs: SimpleNamespace(models=models)
+        genai.types = SimpleNamespace(
+            HttpOptions=lambda **kwargs: kwargs,
+            HttpRetryOptions=lambda **kwargs: kwargs,
+            GenerateContentConfig=lambda **kwargs: kwargs,
+        )
+        google.genai = genai
+
+        with patch.dict(sys.modules, {"google": google, "google.genai": genai}):
+            translated = gemini_translate(cues, "test-key", speaker_count=1)
+
+        self.assertEqual([row["text_vi"] for row in translated], ["Một.", "Hai."])
+        self.assertEqual(len(models.prompts), 2)
+        self.assertIn("Lỗi cần sửa:", models.prompts[1])
 
     def test_atempo_is_valid_for_extreme_speed(self):
         self.assertEqual(_atempo(4.0), "atempo=2,atempo=2.000000")
@@ -221,6 +264,18 @@ class PipelineHelpersTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "thời lượng"):
             _apply_translation_rows(cues, rows, speaker_count=1)
+
+    def test_translation_accepts_one_long_whisper_cue_that_cannot_be_split_by_source_id(self):
+        cues = [{"id": 0, "start": 0, "end": 6, "original": "这是一个完整的句子"}]
+        rows = [{
+            "source_ids": [0], "original_corrected": "这是一个完整的句子。",
+            "text_vi": "Đây là một câu hoàn chỉnh.", "confidence": .9,
+        }]
+
+        translated = _apply_translation_rows(cues, rows, speaker_count=1)
+
+        self.assertEqual(translated[0]["source_ids"], [0])
+        self.assertEqual(translated[0]["end"], 6)
 
     def test_translation_rejects_one_overlong_subtitle_sentence(self):
         cues = [{"id": 0, "start": 0, "end": 3, "original": "一句很长的话"}]

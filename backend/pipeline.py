@@ -216,7 +216,9 @@ def _apply_translation_rows(cues: list[dict], rows: Any, speaker_count: int = 1)
         if not corrected or not translated:
             raise ValueError("Transcript hoặc bản dịch trống")
         group_duration = float(grouped_sources[-1]["end"]) - float(grouped_sources[0]["start"])
-        if group_duration > 4.8:
+        # Gemini can merge source cues but cannot split one Whisper source id.
+        # Reject an overlong merge while preserving a long atomic source cue.
+        if len(source_ids) > 1 and group_duration > 4.8:
             raise ValueError("Một subtitle không được vượt quá 4,8 giây thời lượng lời nói")
         sentence_endings = re.findall(r"(?:[!?。？！]+|(?<!\d)\.)(?=\s|$)", translated)
         if len(sentence_endings) > 1:
@@ -304,11 +306,13 @@ def gemini_translate(cues: list[dict], api_key: str, speaker_count: int = 1) -> 
             raise PipelineError("INVALID_GEMINI_KEY", "Gemini API key không hợp lệ hoặc đã bị khóa.") from error
         raise PipelineError("GEMINI_FAILED", f"Gemini không xử lý được transcript: {error}") from error
     validation_error = None
+    base_prompt = _translation_prompt(cues, speaker_count)
+    prompt = base_prompt
     for _attempt in range(3):
         try:
             response = client.models.generate_content(
                 model=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
-                contents=_translation_prompt(cues, speaker_count),
+                contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_json_schema=_translation_schema(speaker_count), temperature=.1,
@@ -325,7 +329,17 @@ def gemini_translate(cues: list[dict], api_key: str, speaker_count: int = 1) -> 
             return _apply_translation_rows(cues, rows, speaker_count)
         except Exception as error:
             validation_error = error
-    raise PipelineError("GEMINI_RESPONSE_INVALID", f"Gemini không giữ đúng cấu hình vai nói: {validation_error}") from validation_error
+            prompt = (
+                base_prompt
+                + "\n\nKết quả trước không vượt qua kiểm tra bắt buộc. "
+                + f"Lỗi cần sửa: {error}. "
+                + "Hãy tạo lại TOÀN BỘ JSON array từ dữ liệu cue gốc, sửa chính xác lỗi trên; "
+                + "không giải thích và không lặp lại JSON sai."
+            )
+    raise PipelineError(
+        "GEMINI_RESPONSE_INVALID",
+        f"Gemini trả kết quả không đúng cấu trúc sau 3 lần tự sửa: {validation_error}",
+    ) from validation_error
 
 
 def _iou(a: dict, b: dict) -> float:

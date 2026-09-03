@@ -26,7 +26,7 @@ class ServerContractTest(unittest.TestCase):
     def test_health_lists_vietnamese_presets(self):
         response = self.client.get("/api/health", headers=self.auth)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["apiVersion"], "1.5.3")
+        self.assertEqual(response.json()["apiVersion"], "1.5.5")
         self.assertTrue(response.json()["immutableReviews"])
         self.assertEqual([voice["id"] for voice in response.json()["voices"]], [
             "edge:vi-VN-HoaiMyNeural", "edge:vi-VN-NamMinhNeural"

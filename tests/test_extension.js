@@ -100,7 +100,7 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   const sessionWrites = [];
   const event = () => ({ addListener: () => {} });
   const context = {
-    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.3" }) }),
+    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.5" }) }),
     AbortSignal: { timeout: () => ({}) },
     setTimeout: (callback) => { callback(); return 1; },
     chrome: {
@@ -145,8 +145,8 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   };
   vm.runInNewContext(fs.readFileSync("extension/service-worker.js", "utf8"), context);
   assert.equal(typeof updateAvailableListener, "function");
-  await updateAvailableListener({ version: "1.5.4" });
-  assert.ok(sessionWrites.some((value) => value.extensionUpdate?.version === "1.5.4"));
+  await updateAvailableListener({ version: "1.5.5" });
+  assert.ok(sessionWrites.some((value) => value.extensionUpdate?.version === "1.5.5"));
   const response = await new Promise((resolve) => {
     assert.equal(runtimeListener({ type: "OPEN_COLAB" }, {}, resolve), true);
   });

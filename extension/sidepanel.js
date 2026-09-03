@@ -2,7 +2,7 @@ import { CanvasEditor } from "./canvas-editor.js";
 import { cookieSummary, deleteClone, listClones, saveClone } from "./storage.js";
 
 const $ = (selector) => document.querySelector(selector);
-const EXPECTED_API_VERSION = "1.5.3";
+const EXPECTED_API_VERSION = "1.5.5";
 const pageParams = new URLSearchParams(location.search);
 const isManualEditorPage = pageParams.get("manualEditor") === "1";
 const isReviewPlayerPage = pageParams.get("reviewPlayer") === "1";
@@ -201,7 +201,7 @@ function friendlyError(error) {
     TUNNEL_DISCONNECTED: "Phiên Colab đã ngắt. Extension sẽ khởi động lại khi bạn bấm nút.",
     JOB_NOT_FOUND: "Runtime Colab đã khởi động lại nên job cũ không còn. Hãy chạy lại video.",
     NO_SPEECH: "Video không có lời thoại để lồng tiếng.",
-    GEMINI_RESPONSE_INVALID: "Gemini trả kết quả không hợp lệ. Hãy thử lại.",
+    GEMINI_RESPONSE_INVALID: "Gemini chưa chia câu đúng định dạng sau 3 lần tự sửa. Hãy bấm thử lại.",
     INVALID_VOICE_MAP: `Hãy chọn đúng ${state.voiceCount} giọng khác nhau.`,
     STALE_RUNTIME: "Colab đang chạy backend cũ. Extension đang khởi động lại phiên mới…",
   };
@@ -428,7 +428,7 @@ async function ensureServer(action) {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.3 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.5 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
@@ -730,7 +730,7 @@ async function initialize() {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.3 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.5 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
