@@ -26,7 +26,7 @@ class PipelineError(RuntimeError):
 _whisper_model = None
 _omnivoice_model = None
 _ocr_model = None
-TTS_CACHE_VERSION = 5
+TTS_CACHE_VERSION = 6
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
@@ -165,12 +165,12 @@ def transcribe(audio: Path) -> list[dict]:
 def _translation_schema(speaker_count: int = 1) -> dict:
     speaker_count = max(1, min(4, int(speaker_count)))
     properties = {
-        "id": {"type": "integer"},
+        "source_ids": {"type": "array", "items": {"type": "integer"}},
         "original_corrected": {"type": "string"},
         "text_vi": {"type": "string"},
         "confidence": {"type": "number"},
     }
-    required = ["id", "original_corrected", "text_vi", "confidence"]
+    required = ["source_ids", "original_corrected", "text_vi", "confidence"]
     if speaker_count > 1:
         properties.update({"speaker": {"type": "string"}, "gender": {"type": "string"}})
         required.extend(["speaker", "gender"])
@@ -187,20 +187,40 @@ def _translation_schema(speaker_count: int = 1) -> dict:
 def _apply_translation_rows(cues: list[dict], rows: Any, speaker_count: int = 1) -> list[dict]:
     if not isinstance(rows, list):
         raise ValueError("Kết quả không phải JSON array")
-    by_id = {int(row["id"]): row for row in rows if isinstance(row, dict)}
-    expected_ids = {int(cue["id"]) for cue in cues}
-    if len(by_id) != len(rows) or set(by_id) != expected_ids:
-        raise ValueError("Gemini đã thay đổi danh sách id")
+    source_by_id = {int(cue["id"]): cue for cue in cues}
+    expected_ids = [int(cue["id"]) for cue in cues]
+    normalized_rows = []
+    flattened_ids = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Mỗi câu dịch phải là JSON object")
+        raw_ids = row.get("source_ids", [row["id"]] if "id" in row else None)
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ValueError("Mỗi câu dịch phải có source_ids")
+        source_ids = [int(value) for value in raw_ids]
+        if any(value not in source_by_id for value in source_ids):
+            raise ValueError("Gemini đã tạo source id không tồn tại")
+        grouped_sources = [source_by_id[value] for value in source_ids]
+        if any(float(right["start"]) - float(left["end"]) > 1.5 for left, right in zip(grouped_sources, grouped_sources[1:])):
+            raise ValueError("Gemini đã gộp lời thoại qua khoảng nghỉ quá dài")
+        normalized_rows.append((row, source_ids, grouped_sources))
+        flattened_ids.extend(source_ids)
+    if flattened_ids != expected_ids:
+        raise ValueError("Gemini phải dùng mỗi source id đúng một lần và đúng thứ tự")
     speaker_count = max(1, min(4, int(speaker_count)))
     allowed_speakers = {f"S{index}" for index in range(1, speaker_count + 1)}
-    for cue in cues:
-        row = by_id[int(cue["id"])]
+    translated_cues = []
+    for row, source_ids, grouped_sources in normalized_rows:
         corrected = str(row["original_corrected"]).strip()
         translated = str(row["text_vi"]).strip()
         if not corrected or not translated:
             raise ValueError("Transcript hoặc bản dịch trống")
-        cue["original_corrected"] = corrected
-        cue["text_vi"] = translated
+        cue = {
+            "id": source_ids[0], "source_ids": source_ids,
+            "start": float(grouped_sources[0]["start"]), "end": float(grouped_sources[-1]["end"]),
+            "original": " ".join(str(source["original"]).strip() for source in grouped_sources),
+            "original_corrected": corrected, "text_vi": translated,
+        }
         if speaker_count == 1:
             cue["speaker"] = "S1"
             cue["gender"] = "unknown"
@@ -213,9 +233,10 @@ def _apply_translation_rows(cues: list[dict], rows: Any, speaker_count: int = 1)
         if not 0 <= confidence <= 1:
             raise ValueError("Độ tin cậy nằm ngoài khoảng 0–1")
         cue["confidence"] = confidence
-    if speaker_count > 1 and {cue["speaker"] for cue in cues} != allowed_speakers:
+        translated_cues.append(cue)
+    if speaker_count > 1 and {cue["speaker"] for cue in translated_cues} != allowed_speakers:
         raise ValueError(f"Gemini không dùng đủ đúng {speaker_count} vai nói")
-    return cues
+    return translated_cues
 
 
 def _translation_cue_payload(cue: dict) -> dict:
@@ -242,11 +263,14 @@ def _translation_prompt(cues: list[dict], speaker_count: int = 1) -> str:
             "Dùng gender unknown nếu transcript không có bằng chứng rõ ràng về giới tính người nói. "
         )
     return (
-        "Dựa trên whisper_transcript tiếng Trung, sửa lỗi nhận dạng rồi viết lại thành bản dịch tiếng Việt chính xác, tự nhiên. "
+        "Đọc toàn bộ các cue như một transcript liên tục. Dựa trên ngữ cảnh trước/sau để sửa lỗi nhận dạng và từ đồng âm "
+        "(ví dụ phân biệt 掉 và 钓 khi chủ đề là câu cá), rồi viết lại thành bản dịch tiếng Việt chính xác, tự nhiên. "
         "Chỉ dùng nội dung trong transcript; tuyệt đối không sáng tác, suy diễn hoặc thêm kiến thức ngoài lời nói. "
-        "original_corrected phải là transcript tiếng Trung đã sửa. Mọi id, start_seconds, end_seconds và "
-        "duration_seconds là bất biến: không bỏ, thêm, gộp, tách hoặc đổi thời gian cue. text_vi phải đủ nghĩa, "
-        "viết hoa kiểu câu bình thường và hướng tới target_vi_characters để đọc vừa thời lượng gốc; chỉ rút gọn cách diễn đạt, "
+        "Được gộp các cue liền kề thành một câu nói hoàn chỉnh theo ngữ nghĩa và dấu câu, thay vì coi mỗi ranh giới Whisper "
+        "là hết câu. Mỗi output phải có source_ids chứa các id liền kề; toàn bộ id đầu vào phải xuất hiện đúng một lần, "
+        "đúng thứ tự. Không gộp qua khoảng im lặng dài hoặc giữa hai người nói. original_corrected phải là transcript "
+        "tiếng Trung đã sửa của cả nhóm. text_vi phải đủ câu, đủ nghĩa, viết hoa kiểu câu bình thường và hướng tới tổng "
+        "target_vi_characters của các source_ids để đọc vừa toàn bộ thời lượng nhóm; chỉ rút gọn cách diễn đạt, "
         "không được làm mất chủ thể, hành động, con số hay sự kiện chính. " + speaker_instruction + "Dữ liệu cue: " +
         json.dumps([_translation_cue_payload(cue) for cue in cues], ensure_ascii=False)
     )
@@ -674,7 +698,7 @@ def synthesize_verified_clone(
         for attempt in range(attempts):
             candidate = raw.with_name(f"{raw.stem}-attempt-{attempt + 1}.wav")
             candidates.append(candidate)
-            synthesize_cue(text, voice, candidate, voices, target_duration=target_duration)
+            synthesize_cue(text, voice, candidate, voices, target_duration=None)
             trim_repeated_tts_tail(candidate, text)
             score = tts_transcript_score(candidate, text)
             if score > best_score:
@@ -699,14 +723,22 @@ def plan_dubbing_timeline(
 ) -> list[dict]:
     if len(cues) != len(generated_durations):
         raise ValueError("Mỗi cue phải có đúng một audio TTS")
+    speaker_totals = {}
+    for cue, generated in zip(cues, generated_durations):
+        speaker = str(cue.get("speaker") or "S1")
+        totals = speaker_totals.setdefault(speaker, {"generated": 0.0, "source": 0.0})
+        totals["generated"] += max(.05, float(generated))
+        totals["source"] += max(.25, float(cue["end"]) - float(cue["start"]))
+    automatic_speeds = {
+        speaker: min(1.08, max(.95, totals["generated"] / totals["source"]))
+        for speaker, totals in speaker_totals.items()
+    }
     timeline = []
     cursor = 0.0
     for cue, generated in zip(cues, generated_durations):
         start = max(float(cue["start"]), cursor)
-        original_duration = max(.25, float(cue["end"]) - float(cue["start"]))
         generated = max(.05, float(generated))
-        ideal_for_original = generated / original_duration
-        automatic_speed = min(1.15, max(.90, ideal_for_original))
+        automatic_speed = automatic_speeds[str(cue.get("speaker") or "S1")]
         speed = min(1.5, max(.72, automatic_speed * speech_rate))
         end = start + generated / speed
         timeline.append({"start": start, "end": end, "speed": speed})

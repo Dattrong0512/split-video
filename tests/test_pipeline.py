@@ -164,6 +164,37 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertEqual(payload["end_seconds"], 2)
         self.assertEqual(payload["target_vi_characters"], 18)
 
+    def test_gemini_can_merge_whisper_fragments_into_complete_sentences(self):
+        cues = [
+            {"id": 0, "start": 0.0, "end": .45, "original": "今天来河边"},
+            {"id": 1, "start": .45, "end": 1.2, "original": "钓鱼"},
+            {"id": 2, "start": 1.4, "end": 2.4, "original": "还没掉到呢"},
+        ]
+        rows = [
+            {"source_ids": [0, 1], "original_corrected": "今天来河边钓鱼。", "text_vi": "Hôm nay ra bờ sông câu cá.", "confidence": .95},
+            {"source_ids": [2], "original_corrected": "还没钓到呢。", "text_vi": "Vẫn chưa câu được đâu.", "confidence": .9},
+        ]
+
+        translated = _apply_translation_rows(cues, rows, speaker_count=1)
+
+        self.assertEqual(len(translated), 2)
+        self.assertEqual(translated[0]["source_ids"], [0, 1])
+        self.assertEqual((translated[0]["start"], translated[0]["end"]), (0.0, 1.2))
+        self.assertEqual(translated[1]["text_vi"], "Vẫn chưa câu được đâu.")
+
+    def test_gemini_sentence_groups_must_cover_source_cues_once_in_order(self):
+        cues = [
+            {"id": 0, "start": 0, "end": 1, "original": "甲"},
+            {"id": 1, "start": 1, "end": 2, "original": "乙"},
+        ]
+        rows = [
+            {"source_ids": [1], "original_corrected": "乙", "text_vi": "Hai.", "confidence": .9},
+            {"source_ids": [0], "original_corrected": "甲", "text_vi": "Một.", "confidence": .9},
+        ]
+
+        with self.assertRaises(ValueError):
+            _apply_translation_rows(cues, rows, speaker_count=1)
+
     def test_translation_prompt_uses_only_whisper_not_audio_or_ocr(self):
         prompt = _translation_prompt([{
             "id": 2, "start": 1, "end": 2, "original": "只使用语音识别文字", "screen_text": "不要使用OCR",
@@ -171,7 +202,20 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertIn("只使用语音识别文字", prompt)
         self.assertNotIn("不要使用OCR", prompt)
         self.assertNotIn("audio đính kèm", prompt)
-        self.assertIn("start_seconds, end_seconds", prompt)
+        self.assertIn("start_seconds", prompt)
+        self.assertIn("end_seconds", prompt)
+
+    def test_translation_prompt_requests_contextual_homophone_correction_and_sentence_grouping(self):
+        prompt = _translation_prompt([
+            {"id": 0, "start": 0, "end": 1, "original": "今天来河边钓鱼"},
+            {"id": 1, "start": 1, "end": 2, "original": "还没掉到呢"},
+        ], 1)
+
+        self.assertIn("source_ids", prompt)
+        self.assertIn("từ đồng âm", prompt)
+        self.assertIn("gộp các cue liền kề", prompt)
+        self.assertIn("今天来河边钓鱼", prompt)
+        self.assertIn("还没掉到呢", prompt)
 
     def test_translation_schema_stays_simple_for_flash_lite(self):
         schema = _translation_schema()
@@ -213,25 +257,36 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertGreaterEqual(timeline[1]["start"], timeline[0]["end"] + .04 - 1e-9)
         self.assertGreaterEqual(timeline[2]["start"], timeline[1]["end"] + .04 - 1e-9)
 
-    def test_short_and_long_tts_use_natural_speed_limits(self):
+    def test_short_and_long_tts_for_one_character_share_a_natural_speed(self):
         cues = [{"start": 0, "end": 2}, {"start": 2.1, "end": 3}]
         timeline = plan_dubbing_timeline(cues, [.3, 3], 3.2)
-        self.assertAlmostEqual(timeline[0]["speed"], .90)
-        self.assertAlmostEqual(timeline[1]["speed"], 1.15)
+        self.assertAlmostEqual(timeline[0]["speed"], timeline[1]["speed"])
+        self.assertTrue(.95 <= timeline[0]["speed"] <= 1.08)
 
-    def test_tts_within_natural_range_exactly_matches_original_cue_duration(self):
+    def test_automatic_speed_does_not_exceed_natural_limit_to_force_exact_fit(self):
         cue = [{"start": 1, "end": 3}]
         timeline = plan_dubbing_timeline(cue, [2.2], 4)
-        self.assertAlmostEqual(timeline[0]["speed"], 1.1)
-        self.assertAlmostEqual(timeline[0]["end"] - timeline[0]["start"], 2.0)
+        self.assertAlmostEqual(timeline[0]["speed"], 1.08)
+        self.assertAlmostEqual(timeline[0]["end"] - timeline[0]["start"], 2.2 / 1.08)
 
     def test_global_speech_rate_adjusts_fitted_voice_after_automatic_timing(self):
         cue = [{"start": 0, "end": 2}]
         normal = plan_dubbing_timeline(cue, [2.2], 3, speech_rate=1.0)[0]
         faster = plan_dubbing_timeline(cue, [2.2], 3, speech_rate=1.2)[0]
-        self.assertAlmostEqual(normal["speed"], 1.1)
-        self.assertAlmostEqual(faster["speed"], 1.32)
+        self.assertAlmostEqual(normal["speed"], 1.08)
+        self.assertAlmostEqual(faster["speed"], 1.296)
         self.assertLess(faster["end"], normal["end"])
+
+    def test_each_character_uses_one_uniform_automatic_speech_rate(self):
+        cues = [
+            {"start": 0, "end": 1, "speaker": "S1"},
+            {"start": 1.5, "end": 3.5, "speaker": "S1"},
+            {"start": 4, "end": 5, "speaker": "S2"},
+        ]
+        timeline = plan_dubbing_timeline(cues, [.5, 3.0, 1.0], 6)
+
+        self.assertAlmostEqual(timeline[0]["speed"], timeline[1]["speed"])
+        self.assertTrue(all(.90 <= item["speed"] <= 1.15 for item in timeline))
 
     def test_clone_synthesis_uses_cue_duration_and_full_quality_steps(self):
         model = SimpleNamespace(
@@ -323,6 +378,22 @@ class PipelineHelpersTest(unittest.TestCase):
             self.assertFalse(fallback)
             self.assertAlmostEqual(score, .91)
             self.assertEqual(raw.read_bytes(), b"clean-clone")
+
+    def test_verified_clone_is_allowed_to_finish_the_full_sentence_before_timing(self):
+        attempted_durations = []
+        with TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw.wav"
+
+            def fake_synthesize(_text, _voice, path, _voices, target_duration=None):
+                attempted_durations.append(target_duration)
+                path.write_bytes(b"complete-sentence")
+
+            with patch("backend.pipeline.synthesize_cue", side_effect=fake_synthesize), \
+                    patch("backend.pipeline.trim_repeated_tts_tail", return_value=True), \
+                    patch("backend.pipeline.tts_transcript_score", return_value=.95):
+                synthesize_verified_clone("Đây là một câu đầy đủ.", "clone:test", raw, {}, 1.2)
+
+        self.assertEqual(attempted_durations, [None])
 
     def test_overflowing_cues_compact_into_pauses_before_video_end(self):
         cues = [{"start": 1, "end": 2}, {"start": 4, "end": 4.5}]
