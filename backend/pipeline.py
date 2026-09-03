@@ -137,6 +137,20 @@ def extract_assets(source: Path, directory: Path, duration: float) -> tuple[Path
     return audio, data_url
 
 
+def create_browser_preview(source: Path, directory: Path) -> Path:
+    output = directory / "browser-preview.mp4"
+    run([
+        ffmpeg(), "-y", "-i", str(source),
+        "-map", "0:v:0", "-map", "0:a:0?", "-sn",
+        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-pix_fmt", "yuv420p",
+        "-maxrate", "1500k", "-bufsize", "3000k",
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
+        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(output),
+    ], "PREVIEW_ENCODING_FAILED")
+    return output
+
+
 def transcribe(audio: Path) -> list[dict]:
     segments, _ = _whisper().transcribe(
         str(audio), language="zh", vad_filter=True, beam_size=5, condition_on_previous_text=True,
@@ -461,8 +475,9 @@ def detect_blur_regions(source: Path, duration: float) -> list[dict]:
 def analyze_job(job: dict, _voices: dict) -> None:
     update(job, 4, "Đang tải video Douyin…", status="downloading")
     source = download_douyin(job); job["source"] = source
-    update(job, 16, "Đang tách audio và ảnh xem trước…", status="analyzing")
+    update(job, 16, "Đang tạo video xem trước tương thích Chrome…", status="analyzing")
     duration = media_duration(source); dimensions = video_size(source); audio, preview = extract_assets(source, job["work_dir"], duration)
+    job["browser_preview"] = create_browser_preview(source, job["work_dir"])
     update(job, 24, "Whisper đang nhận diện lời thoại…")
     cues = transcribe(audio)
     update(job, 36, "Gemini đang sửa lời thoại và viết lại tiếng Việt theo thời gian gốc…")

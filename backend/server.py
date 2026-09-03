@@ -46,7 +46,7 @@ def public_job(job: dict) -> dict:
     private = {
         "gemini_key", "cookie_text", "download_token", "download_expires",
         "preview_token", "preview_expires", "review_token", "review_expires",
-        "work_dir", "source", "cues", "result", "review_result", "tts_cache", "background",
+        "work_dir", "source", "browser_preview", "cues", "result", "review_result", "tts_cache", "background",
     }
     return {key: value for key, value in job.items() if key not in private}
 
@@ -158,9 +158,9 @@ def start_render(job_id: str, request: RenderRequest) -> dict:
 @app.post("/api/jobs/{job_id}/preview-token", dependencies=[Depends(authorize)])
 def create_preview_token(job_id: str) -> dict:
     job = JOBS.get(job_id)
-    source_value = job.get("source") if job else None
-    source = Path(source_value) if source_value else None
-    if not job or job.get("status") not in {"analysis_ready", "queued_render", "rendering", "complete"} or not source or not source.exists():
+    preview_value = job.get("browser_preview") if job else None
+    preview = Path(preview_value) if preview_value else None
+    if not job or job.get("status") not in {"analysis_ready", "queued_render", "rendering", "complete"} or not preview or not preview.exists():
         raise HTTPException(status_code=409, detail={"code": "PREVIEW_NOT_READY", "message": "Video xem trước chưa sẵn sàng."})
     token = secrets.token_urlsafe(24)
     job["preview_token"] = token
@@ -174,7 +174,7 @@ def preview_video(job_id: str, token: str):
     if not job or token != job.get("preview_token") or time.time() > job.get("preview_expires", 0):
         raise HTTPException(status_code=403, detail="Liên kết xem trước không hợp lệ hoặc đã hết hạn.")
     return FileResponse(
-        job["source"], media_type="video/mp4", filename="preview.mp4",
+        job["browser_preview"], media_type="video/mp4", filename="browser-preview.mp4",
         content_disposition_type="inline", headers={"Cache-Control": "private, max-age=3600"},
     )
 

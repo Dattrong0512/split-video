@@ -90,7 +90,8 @@ class ServerContractTest(unittest.TestCase):
     def test_public_job_never_returns_credentials(self):
         public = server.public_job({
             "id": "job", "gemini_key": "secret-key", "cookie_text": "secret-cookie",
-            "download_token": "secret-token", "preview_token": "preview-secret", "message": "ok",
+            "download_token": "secret-token", "preview_token": "preview-secret",
+            "browser_preview": Path("browser-preview.mp4"), "message": "ok",
         })
         self.assertEqual(public, {"id": "job", "message": "ok"})
 
@@ -98,9 +99,12 @@ class ServerContractTest(unittest.TestCase):
         job_id = "preview-range-test"
         with TemporaryDirectory() as directory:
             source = Path(directory) / "source.mp4"
-            source.write_bytes(b"0123456789")
+            source.write_bytes(b"unsupported-source-codec")
+            browser_preview = Path(directory) / "browser-preview.mp4"
+            browser_preview.write_bytes(b"0123456789")
             server.JOBS[job_id] = {
                 "id": job_id, "status": "analysis_ready", "source": source,
+                "browser_preview": browser_preview,
                 "canonical_url": "https://www.douyin.com/video/7671977232314797347",
             }
             try:

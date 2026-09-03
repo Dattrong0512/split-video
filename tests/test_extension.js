@@ -158,7 +158,47 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   assert.equal(stale.stale, true);
 }
 
-testServiceWorkerReinjectsExistingColabTab()
+async function testCanvasEditorWaitsForDecodedVideoFrame() {
+  const context = {
+    Image: class { constructor() { this.complete = true; } },
+    window: { addEventListener: () => {} },
+  };
+  context.globalThis = context;
+  const source = fs.readFileSync("extension/canvas-editor.js", "utf8")
+    .replace("export class CanvasEditor", "class CanvasEditor") + "\nglobalThis.CanvasEditor = CanvasEditor;";
+  vm.runInNewContext(source, context);
+
+  const noop = () => {};
+  const canvas = {
+    width: 1280, height: 720, style: {}, addEventListener: noop,
+    parentElement: {
+      clientWidth: 1280, clientHeight: 720,
+      style: { setProperty: noop },
+    },
+    getContext: () => ({
+      clearRect: noop, drawImage: noop, fillRect: noop, strokeRect: noop, fillText: noop,
+    }),
+  };
+  const video = {
+    hidden: true, style: {}, videoWidth: 1280, videoHeight: 720,
+    load() { this.onloadedmetadata?.(); },
+  };
+  const editor = new context.CanvasEditor(canvas);
+  let resolved = false;
+  const loading = editor.setVideo(video, "https://preview.example/video.mp4").then(() => { resolved = true; });
+  await Promise.resolve();
+  assert.equal(resolved, false, "metadata alone must not replace the decoded JPEG fallback");
+  assert.equal(editor.video, null);
+  video.onloadeddata();
+  await loading;
+  assert.equal(editor.video, video);
+  assert.equal(video.hidden, false);
+}
+
+Promise.all([
+  testServiceWorkerReinjectsExistingColabTab(),
+  testCanvasEditorWaitsForDecodedVideoFrame(),
+])
   .then(() => {
     const sidepanel = fs.readFileSync("extension/sidepanel.js", "utf8");
     const styles = fs.readFileSync("extension/sidepanel.css", "utf8");
