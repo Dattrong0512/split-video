@@ -23,6 +23,34 @@ async function protectPrivateStorage() {
   await chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
 }
 
+function toNetscapeCookies(cookies) {
+  const rows = [
+    "# Netscape HTTP Cookie File",
+    "# Generated automatically by Douyin Vietnamese Dubbing. Do not edit.",
+    "",
+  ];
+  for (const cookie of [...cookies].sort((left, right) => `${left.domain}\t${left.path}\t${left.name}`.localeCompare(`${right.domain}\t${right.path}\t${right.name}`))) {
+    const rawDomain = cookie.domain || ".douyin.com";
+    const domain = cookie.httpOnly ? `#HttpOnly_${rawDomain}` : rawDomain;
+    rows.push([
+      domain,
+      rawDomain.startsWith(".") ? "TRUE" : "FALSE",
+      cookie.path || "/",
+      cookie.secure ? "TRUE" : "FALSE",
+      Number.isFinite(cookie.expirationDate) ? Math.floor(cookie.expirationDate) : 0,
+      cookie.name,
+      cookie.value,
+    ].join("\t"));
+  }
+  return `${rows.join("\n")}\n`;
+}
+
+async function exportCurrentDouyinCookies() {
+  const cookies = await chrome.cookies.getAll({ domain: "douyin.com" });
+  if (!cookies.length) throw new Error("Không tìm thấy cookie Douyin. Hãy đăng nhập Douyin rồi thử lại.");
+  return { cookieText: toNetscapeCookies(cookies), count: cookies.length };
+}
+
 async function startColabAutomation(tabId, force = true) {
   try {
     await chrome.tabs.sendMessage(tabId, { type: "START_COLAB_AUTOMATION", force, rescan: true });
@@ -37,9 +65,15 @@ async function startColabAutomation(tabId, force = true) {
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   await protectPrivateStorage();
+  await chrome.storage.session.remove("extensionUpdate");
 });
 
 chrome.runtime.onStartup.addListener(() => protectPrivateStorage().catch(() => {}));
+chrome.runtime.onUpdateAvailable.addListener(async (details) => {
+  const payload = { version: details.version, detectedAt: Date.now() };
+  await chrome.storage.session.set({ extensionUpdate: payload });
+  chrome.runtime.sendMessage({ type: "EXTENSION_UPDATE_AVAILABLE", payload }).catch(() => {});
+});
 protectPrivateStorage().catch(() => {});
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 
@@ -106,6 +140,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       })().finally(() => { openingColab = null; });
     }
     openingColab.then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (message?.type === "EXPORT_DOUYIN_COOKIES") {
+    exportCurrentDouyinCookies()
+      .then((result) => sendResponse({ ok: true, ...result }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
   if (message?.type === "DOWNLOAD_RESULT") {

@@ -60,6 +60,25 @@ function setBusy(busy) {
   document.querySelectorAll("[data-blur-mode]").forEach((button) => { button.disabled = busy; });
 }
 
+function showExtensionUpdate(update = null) {
+  const version = update?.version || chrome.runtime.getManifest().version;
+  const row = $("#reload-extension").closest(".reload-row");
+  row.classList.toggle("update-available", Boolean(update));
+  $("#update-status").textContent = update
+    ? `Có bản ${version}. Bấm Nạp lại để áp dụng.`
+    : `Extension ${version} · có thể nạp lại bằng một lần bấm.`;
+}
+
+async function refreshDouyinCookies() {
+  const response = await chrome.runtime.sendMessage({ type: "EXPORT_DOUYIN_COOKIES" });
+  if (!response?.ok) throw { code: "COOKIE_CAPTURE_FAILED", message: response?.error };
+  const summary = cookieSummary(response.cookieText);
+  if (!summary.valid) throw { code: "COOKIE_CAPTURE_FAILED", message: summary.label };
+  await chrome.storage.local.set({ douyinCookies: response.cookieText });
+  $("#cookie-status").textContent = `${summary.label} · tự động cập nhật (${response.count})`;
+  return response.cookieText;
+}
+
 function mediaTime(value) {
   const seconds = Math.max(0, Number.isFinite(value) ? Math.floor(value) : 0);
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
@@ -174,7 +193,8 @@ function errorCode(error) {
 
 function friendlyError(error) {
   const messages = {
-    COOKIE_EXPIRED: "Cookie Douyin đã hết hạn. Hãy import cookies.txt mới.",
+    COOKIE_EXPIRED: "Cookie Douyin hiện tại không dùng được. Hãy đăng nhập lại Douyin rồi thử lại.",
+    COOKIE_CAPTURE_FAILED: "Không tự đọc được cookie Douyin. Hãy đăng nhập Douyin, nạp lại extension rồi thử lại.",
     INVALID_GEMINI_KEY: "Gemini API key không hợp lệ hoặc đã bị khóa. Hãy thay key mới.",
     GPU_UNAVAILABLE: "Colab không cấp được GPU T4. Có thể tài khoản đã hết hạn mức GPU.",
     DOWNLOAD_FAILED: "Không tải được video Douyin. Hãy làm mới cookie rồi thử lại.",
@@ -430,12 +450,10 @@ async function analyze() {
     await findCurrentVideo();
     if (!state.canonicalUrl) return;
   }
-  const saved = await chrome.storage.local.get(["geminiKey", "douyinCookies"]);
+  const saved = await chrome.storage.local.get(["geminiKey"]);
   if (!saved.geminiKey) {
     setBusy(false); setStatus("Hãy nhập và lưu Gemini API key."); $("#gemini-key").focus(); return;
   }
-  const cookie = cookieSummary(saved.douyinCookies);
-  if (!cookie.valid) { setBusy(false); setStatus(cookie.label); return; }
   const voiceError = validateVoiceSelections();
   if (voiceError) { setBusy(false); setStatus(friendlyError(voiceError)); return; }
   state.previewRate = null;
@@ -444,13 +462,15 @@ async function analyze() {
   $("#speed-card").hidden = true;
   setBusy(true);
   try {
+    setStatus("Đang tự động cập nhật cookie từ phiên Douyin hiện tại…", 1);
+    const cookieText = await refreshDouyinCookies();
     if (!await ensureServer("analyze")) return;
     await clearPending();
     setStatus("Đang gửi video sang Colab…", 3);
     const response = await serverFetch("/api/jobs/analyze", {
       method: "POST",
       body: JSON.stringify({
-        canonicalUrl: state.canonicalUrl, cookieText: saved.douyinCookies,
+        canonicalUrl: state.canonicalUrl, cookieText,
         geminiApiKey: saved.geminiKey, blurMode: state.blurMode, voiceCount: state.voiceCount,
       }),
     });
@@ -649,8 +669,9 @@ async function initialize() {
   }
   const [saved, session] = await Promise.all([
     chrome.storage.local.get(["geminiKey", "douyinCookies", "preferredVoice", "preferredVoiceCount", "preferredVoiceMap"]),
-    chrome.storage.session.get(["serverSession", "pendingAction", "activeJob", "colabProgress", "reviewHandoff"]),
+    chrome.storage.session.get(["serverSession", "pendingAction", "activeJob", "colabProgress", "reviewHandoff", "extensionUpdate"]),
   ]);
+  showExtensionUpdate(session.extensionUpdate);
   $("#gemini-key").value = saved.geminiKey || "";
   $("#cookie-status").textContent = saved.douyinCookies ? cookieSummary(saved.douyinCookies).label : "Chưa có cookie.";
   state.clones = await listClones();
@@ -688,6 +709,7 @@ async function initialize() {
     if (session.reviewHandoff?.jobId === state.jobId) state.reviewResume = session.reviewHandoff;
   }
   await findCurrentVideo(Boolean(state.canonicalUrl));
+  refreshDouyinCookies().catch(() => {});
 
   state.server = session.serverSession || null;
   if (state.server) {
@@ -737,6 +759,10 @@ $("#cookie-file").addEventListener("change", async (event) => {
   event.target.value = "";
 });
 $("#clear-cookie").addEventListener("click", async () => { await chrome.storage.local.remove("douyinCookies"); $("#cookie-status").textContent = "Chưa có cookie."; });
+$("#reload-extension").addEventListener("click", async () => {
+  await chrome.storage.session.remove("extensionUpdate");
+  chrome.runtime.reload();
+});
 $("#toggle-settings").addEventListener("click", () => { const body = $("#settings-body"); body.hidden = !body.hidden; $("#toggle-settings").textContent = body.hidden ? "Hiện" : "Ẩn"; });
 $("#refresh-video").addEventListener("click", () => findCurrentVideo());
 $("#default-voice").addEventListener("change", () => {
@@ -853,6 +879,7 @@ $("#clone-file").addEventListener("change", async (event) => {
 });
 
 chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === "EXTENSION_UPDATE_AVAILABLE") showExtensionUpdate(message.payload);
   if (message?.type === "SERVER_SESSION_UPDATED") {
     state.server = message.payload;
     setStatus("Colab đã sẵn sàng. Đang tiếp tục tự động…", 3);

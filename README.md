@@ -12,7 +12,7 @@ Chrome extension lấy video Douyin đang hiển thị, tạo phụ đề và l�
 
 1. Tạo **Gemini API key mới**. Không dùng lại key đã từng gửi công khai.
 2. Mở extension, dán key và bấm **Lưu**. Key chỉ nằm trong Chrome profile hiện tại, không được ghi vào source hoặc đồng bộ.
-3. Export cookie Douyin ở định dạng Netscape `cookies.txt`, sau đó chọn file trong extension. Khi cookie hết hạn, extension sẽ yêu cầu import lại.
+3. Đăng nhập Douyin trong cùng Chrome profile. Extension tự đọc và cập nhật cookie hiện tại khi mở panel và ngay trước mỗi lần phân tích; `cookies.txt` chỉ còn là lựa chọn dự phòng.
 4. Voice clone là clip một người nói rõ, dài 3–10 giây. Chỉ clone giọng bạn có quyền sử dụng.
 
 ## Sử dụng

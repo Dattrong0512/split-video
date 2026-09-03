@@ -95,6 +95,9 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   let healthOk = true;
   let tabUpdateOptions = null;
   let tabUpdatedListener;
+  let cookieQuery = null;
+  let updateAvailableListener;
+  const sessionWrites = [];
   const event = () => ({ addListener: () => {} });
   const context = {
     fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.3" }) }),
@@ -104,12 +107,22 @@ async function testServiceWorkerReinjectsExistingColabTab() {
       sidePanel: { setPanelBehavior: async () => {} },
       storage: {
         local: { setAccessLevel: async () => {} },
-        session: { set: async () => {}, remove: async () => {} },
+        session: { set: async (value) => { sessionWrites.push(value); }, remove: async () => {} },
       },
       runtime: {
         onInstalled: event(), onStartup: event(),
+        onUpdateAvailable: { addListener: (value) => { updateAvailableListener = value; } },
         onMessage: { addListener: (value) => { runtimeListener = value; } },
         sendMessage: async () => {},
+      },
+      cookies: {
+        getAll: async (query) => {
+          cookieQuery = query;
+          return [{
+            domain: ".douyin.com", path: "/", secure: true, httpOnly: true,
+            expirationDate: 2_000_000_000, name: "sessionid", value: "fresh-session",
+          }];
+        },
       },
       tabs: {
         onUpdated: { addListener: (value) => { tabUpdatedListener = value; } }, onRemoved: event(),
@@ -131,6 +144,9 @@ async function testServiceWorkerReinjectsExistingColabTab() {
     },
   };
   vm.runInNewContext(fs.readFileSync("extension/service-worker.js", "utf8"), context);
+  assert.equal(typeof updateAvailableListener, "function");
+  await updateAvailableListener({ version: "1.5.4" });
+  assert.ok(sessionWrites.some((value) => value.extensionUpdate?.version === "1.5.4"));
   const response = await new Promise((resolve) => {
     assert.equal(runtimeListener({ type: "OPEN_COLAB" }, {}, resolve), true);
   });
@@ -156,6 +172,18 @@ async function testServiceWorkerReinjectsExistingColabTab() {
     }, notebookSender, resolve), true);
   });
   assert.equal(stale.stale, true);
+
+  const exportedCookies = await new Promise((resolve) => {
+    assert.equal(runtimeListener({ type: "EXPORT_DOUYIN_COOKIES" }, {}, resolve), true);
+  });
+  assert.equal(cookieQuery.domain, "douyin.com");
+  assert.equal(exportedCookies.ok, true);
+  assert.equal(exportedCookies.count, 1);
+  assert.match(exportedCookies.cookieText, /^# Netscape HTTP Cookie File/m);
+  assert.match(
+    exportedCookies.cookieText,
+    /#HttpOnly_\.douyin\.com\tTRUE\t\/\tTRUE\t2000000000\tsessionid\tfresh-session/,
+  );
 }
 
 async function testCanvasEditorWaitsForDecodedVideoFrame() {
@@ -203,6 +231,7 @@ Promise.all([
     const sidepanel = fs.readFileSync("extension/sidepanel.js", "utf8");
     const styles = fs.readFileSync("extension/sidepanel.css", "utf8");
     const html = fs.readFileSync("extension/sidepanel.html", "utf8");
+    const manifest = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
     const canvasEditor = fs.readFileSync("extension/canvas-editor.js", "utf8");
     assert.match(sidepanel, /sidepanel\.html\?manualEditor=1/);
     assert.match(sidepanel, /chrome\.tabs\.create\(\{ url, active: true \}\)/);
@@ -237,6 +266,11 @@ Promise.all([
     assert.match(sidepanel, /reviewPlayerTab/);
     assert.match(sidepanel, /new BroadcastChannel\("douyin-dubbing-review-playback"\)/);
     assert.match(sidepanel, /health\.apiVersion !== EXPECTED_API_VERSION/);
+    assert.ok(manifest.permissions.includes("cookies"));
+    assert.match(sidepanel, /type: "EXPORT_DOUYIN_COOKIES"/);
+    assert.match(sidepanel, /await refreshDouyinCookies\(\)/);
+    assert.match(html, /id="reload-extension"/);
+    assert.match(sidepanel, /chrome\.runtime\.reload\(\)/);
     assert.match(fs.readFileSync("extension\/content\/colab.js", "utf8"), /newestHandshake === rejectedHandshake/);
     assert.match(sidepanel, /type: "PAUSE_DOUYIN_VIDEO"/);
     assert.match(sidepanel, /reviewHandoff: handoff/);
