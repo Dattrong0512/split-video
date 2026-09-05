@@ -132,7 +132,7 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   const sessionWrites = [];
   const event = () => ({ addListener: () => {} });
   const context = {
-    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.7" }) }),
+    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.8" }) }),
     AbortSignal: { timeout: () => ({}) },
     setTimeout: (callback) => { callback(); return 1; },
     chrome: {
@@ -177,8 +177,8 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   };
   vm.runInNewContext(fs.readFileSync("extension/service-worker.js", "utf8"), context);
   assert.equal(typeof updateAvailableListener, "function");
-  await updateAvailableListener({ version: "1.5.7" });
-  assert.ok(sessionWrites.some((value) => value.extensionUpdate?.version === "1.5.7"));
+  await updateAvailableListener({ version: "1.5.8" });
+  assert.ok(sessionWrites.some((value) => value.extensionUpdate?.version === "1.5.8"));
   const response = await new Promise((resolve) => {
     assert.equal(runtimeListener({ type: "OPEN_COLAB" }, {}, resolve), true);
   });
@@ -330,9 +330,22 @@ async function testCurrentVideoRefreshesStaleSelectionAndRetainsSourceTabAcrossC
   assert.equal(state.canonicalUrl, "https://www.douyin.com/video/7649625894688269809");
   assert.equal(state.sourceTabId, 7);
   activeTab = { id: 8, url: "https://colab.research.google.com/" };
-  assert.equal(await context.findCurrentVideo(), true);
+  assert.equal(await context.findCurrentVideo(false, true), true);
   assert.equal(state.mediaUrl, "https://v3.douyinvod.com/video?revision=2");
+  activeTab = { id: 9, url: "https://www.tiktok.com/@test/video/123" };
+  assert.equal(await context.findCurrentVideo(), false);
+  assert.equal(state.canonicalUrl, "");
 }
+
+function testTranslationErrorKeepsTheActualValidationReason() {
+  const source = fs.readFileSync("extension/sidepanel.js", "utf8");
+  const context = { state: { voiceCount: 1 } };
+  vm.runInNewContext(source.slice(source.indexOf("function errorCode("), source.indexOf("async function serverFetch(")), context);
+  const message = "Gemini trả kết quả không đúng cấu trúc: thiếu source id 7";
+  assert.equal(context.friendlyError({ code: "GEMINI_RESPONSE_INVALID", message }), message);
+  assert.equal(context.friendlyError({ detail: { code: "GEMINI_RESPONSE_INVALID", message } }), message);
+}
+testTranslationErrorKeepsTheActualValidationReason();
 
 Promise.all([
   testServiceWorkerReinjectsExistingColabTab(),

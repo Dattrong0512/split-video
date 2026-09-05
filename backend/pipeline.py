@@ -239,7 +239,7 @@ def create_browser_preview(source: Path, directory: Path) -> Path:
 
 def transcribe(audio: Path) -> list[dict]:
     segments, _ = _whisper().transcribe(
-        str(audio), language="zh", vad_filter=True, beam_size=5, condition_on_previous_text=True,
+        str(audio), language=None, vad_filter=True, beam_size=5, condition_on_previous_text=True,
     )
     cues = [{"id": index, "start": float(segment.start), "end": max(float(segment.end), float(segment.start) + .12), "original": segment.text.strip()}
             for index, segment in enumerate(segments) if segment.text and segment.text.strip()]
@@ -283,6 +283,8 @@ def _apply_translation_rows(cues: list[dict], rows: Any, speaker_count: int = 1)
         raw_ids = row.get("source_ids", [row["id"]] if "id" in row else None)
         if not isinstance(raw_ids, list) or not raw_ids:
             raise ValueError("Mỗi câu dịch phải có source_ids")
+        if any(isinstance(value, bool) or not re.fullmatch(r"\d+", str(value)) for value in raw_ids):
+            raise ValueError("Source id phải là số nguyên")
         source_ids = [int(value) for value in raw_ids]
         if any(value not in source_by_id for value in source_ids):
             raise ValueError("Gemini đã tạo source id không tồn tại")
@@ -297,8 +299,10 @@ def _apply_translation_rows(cues: list[dict], rows: Any, speaker_count: int = 1)
     allowed_speakers = {f"S{index}" for index in range(1, speaker_count + 1)}
     translated_cues = []
     for row, source_ids, grouped_sources in normalized_rows:
-        corrected = str(row["original_corrected"]).strip()
-        translated = str(row["text_vi"]).strip()
+        if not isinstance(row.get("original_corrected"), str) or not isinstance(row.get("text_vi"), str):
+            raise ValueError("Transcript và bản dịch phải là chuỗi văn bản")
+        corrected = row["original_corrected"].strip()
+        translated = " ".join(row["text_vi"].split())
         if not corrected or not translated:
             raise ValueError("Transcript hoặc bản dịch trống")
         group_duration = float(grouped_sources[-1]["end"]) - float(grouped_sources[0]["start"])
@@ -306,13 +310,10 @@ def _apply_translation_rows(cues: list[dict], rows: Any, speaker_count: int = 1)
         # Reject an overlong merge while preserving a long atomic source cue.
         if len(source_ids) > 1 and group_duration > 4.8:
             raise ValueError("Một subtitle không được vượt quá 4,8 giây thời lượng lời nói")
-        sentence_endings = re.findall(r"(?:[!?。？！]+|(?<!\d)\.)(?=\s|$)", translated)
-        if len(sentence_endings) > 1:
-            raise ValueError("Mỗi subtitle chỉ được chứa một câu nói hoàn chỉnh")
-        normalized_translation = " ".join(translated.split())
-        max_characters = max(28, min(56, round(group_duration * 18)))
-        if len(normalized_translation) > max_characters:
-            raise ValueError(f"Subtitle quá dài ({len(normalized_translation)}/{max_characters} ký tự)")
+        # A translated speech cue can span several caption pages. Enforce layout
+        # when writing subtitles, without forcing Gemini to delete spoken meaning.
+        if len(translated) > max(1000, round(group_duration * 100)):
+            raise ValueError("Bản dịch dài bất thường so với lời thoại gốc")
         cue = {
             "id": source_ids[0], "source_ids": source_ids,
             "start": float(grouped_sources[0]["start"]), "end": float(grouped_sources[-1]["end"]),
@@ -345,6 +346,7 @@ def _translation_cue_payload(cue: dict) -> dict:
         "end_seconds": round(float(cue["end"]), 3),
         "duration_seconds": round(duration, 3),
         "target_vi_characters": max(12, round(duration * 18)),
+        "caption_page_characters": 56,
         "whisper_transcript": cue["original"],
     }
 
@@ -366,9 +368,11 @@ def _translation_prompt(cues: list[dict], speaker_count: int = 1) -> str:
         "Chỉ dùng nội dung trong transcript; tuyệt đối không sáng tác, suy diễn hoặc thêm kiến thức ngoài lời nói. "
         "Được gộp các cue liền kề thành một câu nói hoàn chỉnh theo ngữ nghĩa và dấu câu, thay vì coi mỗi ranh giới Whisper "
         "là hết câu. Mỗi output phải có source_ids chứa các id liền kề; toàn bộ id đầu vào phải xuất hiện đúng một lần, "
-        "đúng thứ tự. Mỗi output chỉ chứa một câu, tối đa 4,8 giây, tối đa 56 ký tự tiếng Việt và không gộp nhiều lượt "
-        "đối thoại. Không gộp qua khoảng im lặng dài hoặc giữa hai người nói. original_corrected phải là transcript "
-        "tiếng Trung đã sửa của cả nhóm. text_vi phải đủ câu, đủ nghĩa, viết hoa kiểu câu bình thường và hướng tới tổng "
+        "đúng thứ tự. Không gộp các cue thành nhóm dài quá 4,8 giây và không gộp nhiều lượt "
+        "đối thoại. Một cue đầu vào vốn dài hoặc có nhiều câu phải được dịch đầy đủ, không bỏ bớt nội dung để ép giới hạn. "
+        "Python sẽ chia bản dịch thành các trang phụ đề tối đa 56 ký tự; đó không phải giới hạn của toàn bộ bản dịch. "
+        "Không gộp qua khoảng im lặng dài hoặc giữa hai người nói. original_corrected phải là transcript "
+        "đã sửa của cả nhóm, giữ nguyên ngôn ngữ gốc kể cả khi không phải tiếng Trung. text_vi phải đủ câu, đủ nghĩa, viết hoa kiểu câu bình thường và hướng tới tổng "
         "target_vi_characters của các source_ids để đọc vừa toàn bộ thời lượng nhóm; chỉ rút gọn cách diễn đạt, "
         "không được làm mất chủ thể, hành động, con số hay sự kiện chính. " + speaker_instruction + "Dữ liệu cue: " +
         json.dumps([_translation_cue_payload(cue) for cue in cues], ensure_ascii=False)
@@ -421,6 +425,8 @@ def gemini_translate(cues: list[dict], api_key: str, speaker_count: int = 1) -> 
                 + f"Lỗi cần sửa: {error}. "
                 + "Hãy tạo lại TOÀN BỘ JSON array từ dữ liệu cue gốc, sửa chính xác lỗi trên; "
                 + "không giải thích và không lặp lại JSON sai."
+                + ("\nLần sửa cuối: không gộp cue. Mỗi output dùng source_ids=[id] của đúng một cue đầu vào. "
+                   "Giữ toàn bộ nội dung dịch, kể cả cue dài hoặc có nhiều câu." if _attempt == 1 else "")
             )
     raise PipelineError(
         "GEMINI_RESPONSE_INVALID",
@@ -1040,11 +1046,45 @@ def write_ass(path: Path, cues: list[dict], rect, dimensions: tuple[int, int] = 
     header = f"[Script Info]\nScriptType: v4.00+\nPlayResX: {width}\nPlayResY: {height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n"
     header += f"Style: Vietnamese,Noto Sans,{size},&H00FFFFFF,&H000000FF,&H00101010,&H80000000,-1,0,0,0,100,100,0,0,1,2,1,2,20,20,20,1\n\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
     events = []
-    for cue in cues:
+    for cue in subtitle_pages(cues, min(56, max_chars * 2)):
         text = cue["text_vi"].replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
         text = _wrapped_ass_text(text, max_chars)
         events.append(f"Dialogue: 0,{ass_time(cue['start'])},{ass_time(cue['end'])},Vietnamese,,0,0,0,,{{\\an5\\q2\\pos({x},{y})}}{text}")
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8-sig")
+
+
+def subtitle_pages(cues: list[dict], max_characters: int = 56) -> list[dict]:
+    pages = []
+    for cue in cues:
+        text = " ".join(cue["text_vi"].split())
+        start, end = float(cue["start"]), float(cue["end"])
+        if not text or end <= start:
+            continue
+        sentences = re.split(r"(?<=[.!?。？！])\s+", text)
+        chunks = [part for sentence in sentences for part in textwrap.wrap(
+            sentence, width=max_characters, break_long_words=True, break_on_hyphens=False)]
+        # Split long holds further where possible; timing is estimated inside the
+        # fitted speech cue, never fed back into voice synthesis or source timing.
+        needed = math.ceil((end - start) / 4.8)
+        while len(chunks) < needed:
+            index = max(range(len(chunks)), key=lambda item: len(chunks[item]))
+            longest = chunks[index]
+            boundaries = [match.start() for match in re.finditer(r"\s+", longest)]
+            if not boundaries:
+                break
+            boundary = min(boundaries, key=lambda item: abs(item - len(longest) / 2))
+            chunks[index:index + 1] = [longest[:boundary].strip(), longest[boundary:].strip()]
+        step = (end - start) / len(chunks)
+        for index, chunk in enumerate(chunks):
+            page_start = start + step * index
+            page_end = end if index == len(chunks) - 1 else start + step * (index + 1)
+            # A single long-held word can stay visible across consecutive events.
+            pieces = max(1, math.ceil((page_end - page_start) / 4.8))
+            for part in range(pieces):
+                pages.append({**cue, "text_vi": chunk,
+                              "start": page_start + (page_end - page_start) * part / pieces,
+                              "end": page_start + (page_end - page_start) * (part + 1) / pieces})
+    return pages
 
 
 def video_filter(regions: list, ass_path: Path, subtitle_rect=None) -> str:

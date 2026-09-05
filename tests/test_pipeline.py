@@ -14,7 +14,7 @@ from backend.pipeline import (
     _v3_ocr_boxes, _v3_ocr_rows, audio_mix_filter, cluster_rectangles, encoding_options, media_duration,
     ensure_portrait_subtitle_blur, gemini_translate, plan_dubbing_timeline, transcribe,
     create_dubbing, render_job, repeated_tts_tail_cutoff, separate_background, synthesize_cue, synthesize_verified_clone, tts_text_score,
-    video_filter, write_ass,
+    subtitle_pages, video_filter, write_ass,
 )
 
 
@@ -148,14 +148,14 @@ class PipelineHelpersTest(unittest.TestCase):
         ]
         self.assertEqual(_screen_subtitle_text(rows), "这是原来的字幕\n第二行")
 
-    def test_whisper_is_constrained_to_chinese_for_douyin(self):
+    def test_whisper_detects_source_language_instead_of_forcing_chinese(self):
         model = SimpleNamespace(transcribe=MagicMock(return_value=(
             [SimpleNamespace(start=0, end=1, text="你好")], None,
         )))
         with patch("backend.pipeline._whisper", return_value=model):
             cues = transcribe(Path("audio.mp3"))
         self.assertEqual(cues[0]["original"], "你好")
-        self.assertEqual(model.transcribe.call_args.kwargs["language"], "zh")
+        self.assertIsNone(model.transcribe.call_args.kwargs["language"])
 
     def test_translation_rows_preserve_ids_and_store_correction_confidence(self):
         cues = [{"id": 7, "start": 0, "end": 1, "original": "泥好"}]
@@ -238,7 +238,7 @@ class PipelineHelpersTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _apply_translation_rows(cues, rows, speaker_count=1)
 
-    def test_translation_rejects_a_multi_sentence_group_that_would_fill_the_screen(self):
+    def test_multi_sentence_translation_is_preserved_and_split_into_caption_pages(self):
         cues = [
             {"id": 0, "start": 0, "end": 1.2, "original": "老板我想吃螺蛳粉"},
             {"id": 1, "start": 1.2, "end": 2.5, "original": "可以你能请我吃吗"},
@@ -250,8 +250,11 @@ class PipelineHelpersTest(unittest.TestCase):
             "confidence": .9,
         }]
 
-        with self.assertRaisesRegex(ValueError, "một câu"):
-            _apply_translation_rows(cues, rows, speaker_count=1)
+        translated = _apply_translation_rows(cues, rows, speaker_count=1)
+        pages = subtitle_pages(translated)
+        self.assertEqual(" ".join(page["text_vi"] for page in pages), rows[0]["text_vi"])
+        self.assertTrue(all(len(page["text_vi"]) <= 56 for page in pages))
+        self.assertEqual(translated[0]["source_ids"], [0, 1, 2])
 
     def test_translation_rejects_a_group_longer_than_one_subtitle_window(self):
         cues = [
@@ -277,7 +280,7 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertEqual(translated[0]["source_ids"], [0])
         self.assertEqual(translated[0]["end"], 6)
 
-    def test_translation_rejects_one_overlong_subtitle_sentence(self):
+    def test_long_translation_no_longer_fails_due_to_caption_width(self):
         cues = [{"id": 0, "start": 0, "end": 3, "original": "一句很长的话"}]
         rows = [{
             "source_ids": [0], "original_corrected": "一句很长的话。",
@@ -285,8 +288,30 @@ class PipelineHelpersTest(unittest.TestCase):
             "confidence": .9,
         }]
 
-        with self.assertRaisesRegex(ValueError, "quá dài"):
-            _apply_translation_rows(cues, rows, speaker_count=1)
+        translated = _apply_translation_rows(cues, rows, speaker_count=1)
+        pages = subtitle_pages(translated)
+        self.assertGreater(len(pages), 1)
+        self.assertEqual(" ".join(page["text_vi"] for page in pages), rows[0]["text_vi"])
+        self.assertEqual((translated[0]["start"], translated[0]["end"]), (0, 3))
+
+    def test_caption_pages_preserve_timing_and_do_not_modify_speech_cues(self):
+        cue = {"start": 1, "end": 16, "text_vi": "Đây là một câu dài nhưng vẫn cần giữ đầy đủ nội dung để người xem hiểu."}
+        original = dict(cue)
+        pages = subtitle_pages([cue])
+        self.assertEqual(cue, original)
+        self.assertEqual(pages[0]["start"], 1)
+        self.assertEqual(pages[-1]["end"], 16)
+        self.assertTrue(all(0 < page["end"] - page["start"] <= 4.8 for page in pages))
+        for left, right in zip(pages, pages[1:]):
+            self.assertAlmostEqual(left["end"], right["start"])
+        self.assertEqual(" ".join(page["text_vi"] for page in pages), cue["text_vi"])
+
+    def test_invalid_translation_types_are_not_converted_to_spoken_none_or_ids(self):
+        cue = [{"id": 0, "start": 0, "end": 1, "original": "Hello"}]
+        row = {"source_ids": [0], "original_corrected": "Hello", "text_vi": "Xin chào.", "confidence": .9}
+        for changed in [{"text_vi": None}, {"original_corrected": 123}, {"source_ids": [0.5]}, {"source_ids": [True]}]:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                _apply_translation_rows(cue, [{**row, **changed}])
 
     def test_translation_prompt_uses_only_whisper_not_audio_or_ocr(self):
         prompt = _translation_prompt([{

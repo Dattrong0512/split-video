@@ -3,7 +3,7 @@ import { cookieSummary, deleteClone, listClones, saveClone } from "./storage.js"
 import { readPageMedia } from "./page-media.js";
 
 const $ = (selector) => document.querySelector(selector);
-const EXPECTED_API_VERSION = "1.5.7";
+const EXPECTED_API_VERSION = "1.5.8";
 const pageParams = new URLSearchParams(location.search);
 const isManualEditorPage = pageParams.get("manualEditor") === "1";
 const isReviewPlayerPage = pageParams.get("reviewPlayer") === "1";
@@ -204,6 +204,9 @@ function errorCode(error) {
 }
 
 function friendlyError(error) {
+  if (errorCode(error) === "GEMINI_RESPONSE_INVALID") {
+    return error?.message || error?.detail?.message || "Gemini trả bản dịch không hợp lệ. Hãy thử phân tích lại.";
+  }
   const messages = {
     COOKIE_EXPIRED: "Douyin yêu cầu xác thực phiên tải. Hãy mở lại video trên Douyin rồi thử lại.",
     COOKIE_CAPTURE_FAILED: "Không tự đọc được cookie Douyin. Hãy đăng nhập Douyin, nạp lại extension rồi thử lại.",
@@ -214,7 +217,6 @@ function friendlyError(error) {
     TUNNEL_DISCONNECTED: "Phiên Colab đã ngắt. Extension sẽ khởi động lại khi bạn bấm nút.",
     JOB_NOT_FOUND: "Runtime Colab đã khởi động lại nên job cũ không còn. Hãy chạy lại video.",
     NO_SPEECH: "Video không có lời thoại để lồng tiếng.",
-    GEMINI_RESPONSE_INVALID: "Gemini chưa chia câu đúng định dạng sau 3 lần tự sửa. Hãy bấm thử lại.",
     INVALID_VOICE_MAP: `Hãy chọn đúng ${state.voiceCount} giọng khác nhau.`,
     STALE_RUNTIME: "Colab đang chạy backend cũ. Extension đang khởi động lại phiên mới…",
   };
@@ -255,10 +257,10 @@ async function checkServer(retries = 2) {
   throw lastError || { code: "TUNNEL_DISCONNECTED" };
 }
 
-async function findCurrentVideo(preserveExisting = false) {
+async function findCurrentVideo(preserveExisting = false, useSourceTab = false) {
   if (preserveExisting && state.jobId) return true;
   let [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if ((!tab || !/^https:\/\/([^/]+\.)?douyin\.com\//.test(tab.url || "")) && state.sourceTabId) {
+  if (state.sourceTabId && (useSourceTab || (preserveExisting && (!tab || !/^https:\/\/([^/]+\.)?douyin\.com\//.test(tab.url || ""))))) {
     tab = await chrome.tabs.get(state.sourceTabId).catch(() => null);
   }
   state.mediaUrl = null;
@@ -460,7 +462,7 @@ async function ensureServer(action) {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.7 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.8 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
@@ -477,10 +479,16 @@ async function ensureServer(action) {
   return false;
 }
 
-async function analyze() {
-  if (!await findCurrentVideo()) {
+async function analyze(resuming = false) {
+  const requestedUrl = state.canonicalUrl;
+  if (!await findCurrentVideo(false, resuming)) {
     setBusy(false);
     setStatus("Hãy mở video cần xử lý trên Douyin rồi bấm phân tích lại.");
+    return;
+  }
+  if (resuming && requestedUrl && requestedUrl !== state.canonicalUrl) {
+    setBusy(false);
+    setStatus("Video trong tab Douyin đã thay đổi khi chờ Colab. Hãy mở đúng video và bấm phân tích lại.");
     return;
   }
   const saved = await chrome.storage.local.get(["geminiKey"]);
@@ -716,7 +724,7 @@ async function resumePending() {
   const action = state.pending;
   if (!action) return;
   await clearPending();
-  if (action === "analyze") analyze();
+  if (action === "analyze") analyze(true);
 }
 
 async function initialize() {
@@ -789,7 +797,7 @@ async function initialize() {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.7 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.8 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
