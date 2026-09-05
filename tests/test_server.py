@@ -26,7 +26,7 @@ class ServerContractTest(unittest.TestCase):
     def test_health_lists_vietnamese_presets(self):
         response = self.client.get("/api/health", headers=self.auth)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["apiVersion"], "1.5.6")
+        self.assertEqual(response.json()["apiVersion"], "1.5.7")
         self.assertTrue(response.json()["immutableReviews"])
         self.assertEqual([voice["id"] for voice in response.json()["voices"]], [
             "edge:vi-VN-HoaiMyNeural", "edge:vi-VN-NamMinhNeural"
@@ -109,6 +109,7 @@ class ServerContractTest(unittest.TestCase):
             "id": "job", "gemini_key": "secret-key", "cookie_text": "secret-cookie",
             "download_token": "secret-token", "preview_token": "preview-secret",
             "browser_preview": Path("browser-preview.mp4"), "message": "ok",
+            "media_url": "https://example/signature-secret", "browser_user_agent": "browser",
         })
         self.assertEqual(public, {"id": "job", "message": "ok"})
 

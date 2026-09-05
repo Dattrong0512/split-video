@@ -27,7 +27,7 @@ JOBS: dict[str, dict] = {}
 VOICES: dict[str, dict] = {}
 LOCK = threading.RLock()
 
-app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.5.6", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.5.7", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
@@ -44,7 +44,7 @@ def authorize(authorization: str | None = Header(default=None)) -> None:
 
 def public_job(job: dict) -> dict:
     private = {
-        "gemini_key", "cookie_text", "download_token", "download_expires",
+        "gemini_key", "cookie_text", "media_url", "browser_user_agent", "download_token", "download_expires",
         "preview_token", "preview_expires", "review_token", "review_expires", "review_links",
         "work_dir", "source", "browser_preview", "cues", "result", "review_result", "tts_cache", "background",
     }
@@ -83,7 +83,7 @@ def run_render(job_id: str, request: RenderRequest) -> None:
 @app.get("/api/health", dependencies=[Depends(authorize)])
 def health() -> dict:
     return {
-        "ok": True, "apiVersion": "1.5.6",
+        "ok": True, "apiVersion": "1.5.7",
         "immutableReviews": True,
         "voices": [
             {"id": "edge:vi-VN-HoaiMyNeural", "name": "Hoài My · Nữ"},
@@ -103,6 +103,7 @@ def create_analysis(request: AnalyzeRequest) -> dict:
         JOBS[job_id] = {
             "id": job_id, "status": "queued", "progress": 1, "message": "Đang bắt đầu phân tích trên Colab…",
             "canonical_url": request.canonicalUrl, "cookie_text": request.cookieText,
+            "media_url": request.mediaUrl, "browser_user_agent": request.browserUserAgent,
             "gemini_key": request.geminiApiKey, "blur_mode": request.blurMode,
             "voice_count": request.voiceCount,
             "work_dir": work_dir, "cancelled": False,

@@ -23,6 +23,8 @@ class AnalyzeRequest(BaseModel):
     geminiApiKey: str = Field(min_length=10, max_length=512)
     blurMode: Literal["auto", "manual"] = "auto"
     voiceCount: int = Field(default=1, ge=1, le=4)
+    mediaUrl: str | None = Field(default=None, max_length=16384)
+    browserUserAgent: str = Field(default="", max_length=1024, pattern=r"^[^\r\n]*$")
 
 
 class RenderRequest(BaseModel):

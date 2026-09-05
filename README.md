@@ -29,9 +29,15 @@ Với voice clone, OmniVoice được tạo ở 32 bước. Lần đầu cho gi�
 
 Mỗi link preview gắn với đúng bản âm thanh đã tạo, nên mở thêm tab hoặc tạo preview mới không làm thay đổi nội dung của link cũ. Lỗi tải preview có thời gian chờ tối đa 30 giây và cho phép thử lại.
 
-### Áp dụng bản sửa 1.5.6
+### Áp dụng bản sửa 1.5.7
 
 Notebook hiện lấy backend từ nhánh `main` của `Dattrong0512/split-video` trên GitHub. Thay đổi trong thư mục trên máy chưa tự cập nhật lên Colab: cần đưa bản sửa lên kho mã đó trước, chạy lại notebook và nạp lại extension. Nên nghe thử ở **1,00×** trước khi chỉnh thanh tốc độ. Kiểm thử cục bộ dùng audio tổng hợp; chất lượng và nhịp đọc của giọng clone cụ thể cần được nghe kiểm tra trên Colab.
+
+### Douyin phát được nhưng Colab không tải được
+
+Phát video trong Chrome và tải bằng yt-dlp trên Colab là hai yêu cầu khác nhau. Douyin có thể không trả API chi tiết video cho Colab dù Chrome vẫn xem bình thường; lỗi `Fresh cookies` của yt-dlp không đủ để kết luận phiên đăng nhập đã hết hạn.
+
+Bản 1.5.7 lấy lại đúng video trước mỗi lần phân tích, ghi nhớ tab Douyin khi chuyển sang Colab và gửi User-Agent của Chrome cùng link media hiện tại. Với player dùng `blob:`, extension tìm link trong dữ liệu trang theo đúng ID video. Colab ưu tiên tải media trực tiếp, kiểm tra đủ cả hình lẫn âm thanh rồi mới dùng yt-dlp dự phòng. Link media chỉ được gửi đến phiên Colab và không xuất hiện trong API trạng thái job. Nếu cả hai cách đều bị từ chối, giao diện báo lỗi truy cập từ Colab và đề nghị phát video rồi thử lại, không khẳng định cookie hết hạn. Cách lấy dữ liệu player phụ thuộc cấu trúc Douyin; cần kiểm tra trên trang thật nếu Douyin thay đổi player hoặc ràng buộc link theo IP.
 
 Extension kiểm tra đúng phiên bản backend khi nối lại Colab. Nếu notebook vẫn chạy backend cũ, extension tự làm mới notebook và tạo lại job thay vì tiếp tục phát preview/cache cũ.
 

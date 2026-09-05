@@ -40,6 +40,38 @@ assert.equal(
 );
 assert.equal(sourcePaused, true);
 
+const visibleMedia = (src, x = 0) => ({
+  currentSrc: src, paused: true,
+  getBoundingClientRect: () => ({ left: x, right: x + 400, top: 0, bottom: 500 }),
+});
+const detectedMedia = runDouyin(
+  "https://www.douyin.com/search/test?modal_id=7649625894688269809",
+  { aweme_id: "7634064818458152218" }, { type: "GET_CURRENT_DOUYIN_VIDEO" },
+  [visibleMedia("https://v3.douyinvod.com/hidden.mp4", 3000), visibleMedia("https://v3.douyinvod.com/current.mp4")],
+);
+assert.equal(detectedMedia.canonicalUrl, "https://www.douyin.com/video/7649625894688269809");
+assert.equal(detectedMedia.mediaUrl, "https://v3.douyinvod.com/current.mp4");
+assert.equal(runDouyin("https://www.douyin.com/video/7649625894688269809", null,
+  { type: "GET_CURRENT_DOUYIN_VIDEO" }, [visibleMedia("blob:https://www.douyin.com/local")]).mediaUrl, undefined);
+
+function testBlobMediaUsesOnlyTheRequestedVideoRecord() {
+  const source = fs.readFileSync("extension/page-media.js", "utf8").replace("export function", "function");
+  const record = { aweme_id: "7649625894688269809", video: { play_addr: { url_list: ["https://v3.douyinvod.com/correct.mp4"] } } };
+  const data = { memoizedProps: { item: record }, sibling: { memoizedProps: {
+    item: { aweme_id: "7634064818458152218", video: { play_addr: { url_list: ["https://v3.douyinvod.com/wrong.mp4"] } } },
+  } } };
+  data.return = data;
+  const video = { ...visibleMedia("blob:local"), __reactFiber$test: data };
+  const context = { Node: class {}, innerWidth: 1920, innerHeight: 1080,
+    document: { querySelectorAll: (selector) => selector === "video" ? [video] : [] } };
+  vm.runInNewContext(source, context);
+  assert.equal(context.readPageMedia("7649625894688269809").mediaUrl, "https://v3.douyinvod.com/correct.mp4");
+  assert.equal(context.readPageMedia("9999999999999999999"), null);
+  record.video = { playAddr: [{ src: "https://v3.douyinvod.com/camel-case.mp4" }] };
+  assert.equal(context.readPageMedia("7649625894688269809").mediaUrl, "https://v3.douyinvod.com/camel-case.mp4");
+}
+testBlobMediaUsesOnlyTheRequestedVideoRecord();
+
 function runColabWithShadowOutput(output) {
   const messages = [];
   let listener;
@@ -100,7 +132,7 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   const sessionWrites = [];
   const event = () => ({ addListener: () => {} });
   const context = {
-    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.6" }) }),
+    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.7" }) }),
     AbortSignal: { timeout: () => ({}) },
     setTimeout: (callback) => { callback(); return 1; },
     chrome: {
@@ -145,8 +177,8 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   };
   vm.runInNewContext(fs.readFileSync("extension/service-worker.js", "utf8"), context);
   assert.equal(typeof updateAvailableListener, "function");
-  await updateAvailableListener({ version: "1.5.6" });
-  assert.ok(sessionWrites.some((value) => value.extensionUpdate?.version === "1.5.6"));
+  await updateAvailableListener({ version: "1.5.7" });
+  assert.ok(sessionWrites.some((value) => value.extensionUpdate?.version === "1.5.7"));
   const response = await new Promise((resolve) => {
     assert.equal(runtimeListener({ type: "OPEN_COLAB" }, {}, resolve), true);
   });
@@ -276,11 +308,38 @@ async function testCancelledPollCannotRestartTheOldJob() {
   await polling;
 }
 
+async function testCurrentVideoRefreshesStaleSelectionAndRetainsSourceTabAcrossColab() {
+  let activeTab = { id: 7, url: "https://www.douyin.com/search/test?modal_id=7649625894688269809" };
+  const sourceTab = activeTab;
+  const state = { canonicalUrl: "https://www.douyin.com/video/7634064818458152218" };
+  let mediaRevision = 0;
+  const context = {
+    state, $: () => ({}), setStatus() {},
+    chrome: { tabs: {
+      query: async () => [activeTab],
+      get: async (id) => { assert.equal(id, 7); return sourceTab; },
+      sendMessage: async (id) => {
+        assert.equal(id, 7);
+        return { ok: true, canonicalUrl: "https://www.douyin.com/video/7649625894688269809",
+          mediaUrl: `https://v3.douyinvod.com/video?revision=${++mediaRevision}`, userAgent: "Chrome-Test" };
+      },
+    } },
+  };
+  vm.runInNewContext(sidepanelFunction("findCurrentVideo", "function voiceCatalog"), context);
+  assert.equal(await context.findCurrentVideo(), true);
+  assert.equal(state.canonicalUrl, "https://www.douyin.com/video/7649625894688269809");
+  assert.equal(state.sourceTabId, 7);
+  activeTab = { id: 8, url: "https://colab.research.google.com/" };
+  assert.equal(await context.findCurrentVideo(), true);
+  assert.equal(state.mediaUrl, "https://v3.douyinvod.com/video?revision=2");
+}
+
 Promise.all([
   testServiceWorkerReinjectsExistingColabTab(),
   testCanvasEditorWaitsForDecodedVideoFrame(),
   testReviewLoadingHandlesErrorsAndResetsPlaybackSpeed(),
   testCancelledPollCannotRestartTheOldJob(),
+  testCurrentVideoRefreshesStaleSelectionAndRetainsSourceTabAcrossColab(),
 ])
   .then(() => {
     const sidepanel = fs.readFileSync("extension/sidepanel.js", "utf8");

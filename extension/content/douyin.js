@@ -7,10 +7,22 @@ function canonicalFromText(value) {
 }
 
 function visibleScore(element) {
+  if (!element.getBoundingClientRect) return 0;
   const rect = element.getBoundingClientRect();
   const width = Math.max(0, Math.min(innerWidth, rect.right) - Math.max(0, rect.left));
   const height = Math.max(0, Math.min(innerHeight, rect.bottom) - Math.max(0, rect.top));
   return width * height * (element.paused ? 1 : 4);
+}
+
+function activeMedia() {
+  const userAgent = globalThis.navigator?.userAgent || "";
+  const video = [...document.querySelectorAll("video")]
+    .filter((item) => visibleScore(item) > 0)
+    .sort((a, b) => visibleScore(b) - visibleScore(a))[0];
+  if (!video) return { userAgent };
+  const candidates = [video.currentSrc, video.src, ...[...(video.querySelectorAll?.("source[src]") || [])].map((item) => item.src)];
+  const mediaUrl = candidates.find((value) => /^https:\/\//i.test(value || ""));
+  return mediaUrl ? { mediaUrl, userAgent } : { userAgent };
 }
 
 function currentDouyinVideo() {
@@ -50,7 +62,7 @@ function currentDouyinVideo() {
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "GET_CURRENT_DOUYIN_VIDEO") {
     const result = currentDouyinVideo();
-    sendResponse(result ? { ok: true, ...result } : { ok: false, error: "Không tìm thấy video Douyin đang hiển thị." });
+    sendResponse(result ? { ok: true, ...result, ...activeMedia() } : { ok: false, error: "Không tìm thấy video Douyin đang hiển thị." });
     return false;
   }
   if (message?.type === "PAUSE_DOUYIN_VIDEO") {

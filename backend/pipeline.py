@@ -12,9 +12,12 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 class PipelineError(RuntimeError):
@@ -101,18 +104,97 @@ def _whisper():
     return _whisper_model
 
 
+def allowed_douyin_media_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").lower()
+        domains = ("douyinvod.com", "douyin.com", "bytecdn.cn", "ibytedtos.com", "bytedance.com")
+        return (parsed.scheme == "https" and parsed.port in (None, 443)
+                and not parsed.username and not parsed.password
+                and not any(char.isspace() for char in value)
+                and any(host == domain or host.endswith("." + domain) for domain in domains))
+    except (TypeError, ValueError):
+        return False
+
+
+class DouyinMediaRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not allowed_douyin_media_url(newurl):
+            raise PipelineError("DOWNLOAD_FAILED", "Link media chuyển hướng đến máy chủ không được hỗ trợ.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download_browser_media(job: dict, media_url: str, user_agent: str) -> Path:
+    if not allowed_douyin_media_url(media_url):
+        raise PipelineError("DOWNLOAD_FAILED", "Link media không thuộc máy chủ video Douyin được hỗ trợ.")
+    directory = job["work_dir"]
+    temporary = directory / "browser-media.part"
+    output = directory / "source.mp4"
+    headers = {"Referer": "https://www.douyin.com/"}
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    opener = build_opener(DouyinMediaRedirectHandler())
+    maximum = 1024 * 1024 * 1024
+    deadline = time.monotonic() + 600
+    try:
+        with opener.open(Request(media_url, headers=headers), timeout=30) as response:
+            if not allowed_douyin_media_url(response.geturl()):
+                raise PipelineError("DOWNLOAD_FAILED", "Địa chỉ media không hợp lệ.")
+            if response.status != 200 or "text/html" in response.headers.get("Content-Type", "").lower():
+                raise PipelineError("DOWNLOAD_FAILED", "Douyin không trả về file video.")
+            expected_size = int(response.headers.get("Content-Length", "0"))
+            if expected_size > maximum:
+                raise PipelineError("DOWNLOAD_FAILED", "Video vượt giới hạn tải 1 GB.")
+            size = 0
+            with temporary.open("wb") as stream:
+                while chunk := response.read(1024 * 1024):
+                    if job.get("cancelled"):
+                        raise PipelineError("CANCELLED", "Job đã bị hủy.")
+                    size += len(chunk)
+                    if size > maximum or time.monotonic() > deadline:
+                        raise PipelineError("DOWNLOAD_FAILED", "Video quá lớn hoặc tải quá lâu.")
+                    stream.write(chunk)
+            if expected_size and size != expected_size:
+                raise PipelineError("DOWNLOAD_FAILED", "File video tải chưa đầy đủ.")
+        # Validate and remux both tracks; a video-only browser stream needs the extractor fallback.
+        run([ffmpeg(), "-y", "-protocol_whitelist", "file,pipe", "-f", "mov", "-i", str(temporary), "-map", "0:v:0", "-map", "0:a:0",
+             "-c", "copy", "-movflags", "+faststart", str(output)], "DOWNLOAD_FAILED")
+        return output
+    except Exception:
+        output.unlink(missing_ok=True)
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def download_douyin(job: dict) -> Path:
-    from yt_dlp import YoutubeDL
 
     directory: Path = job["work_dir"]
     cookie_file = directory / "cookies.txt"
-    cookie_file.write_text(job.pop("cookie_text"), encoding="utf-8")
+    cookie_text = job.pop("cookie_text")
+    media_url = job.pop("media_url", None)
+    user_agent = job.pop("browser_user_agent", "")
+    headers = {"Referer": "https://www.douyin.com/"}
+    if user_agent:
+        headers["User-Agent"] = user_agent
     options = {
         "format": "bv*+ba/b", "merge_output_format": "mp4", "outtmpl": str(directory / "source.%(ext)s"),
         "cookiefile": str(cookie_file), "noplaylist": True, "quiet": True, "no_warnings": True,
-        "http_headers": {"Referer": "https://www.douyin.com/"},
+        "http_headers": headers, "socket_timeout": 30, "retries": 2,
     }
     try:
+        if media_url and allowed_douyin_media_url(media_url):
+            update(job, 5, "Đang tải trực tiếp media của video đang phát trong Chrome…")
+            try:
+                return download_browser_media(job, media_url, user_agent)
+            except PipelineError as error:
+                if error.code == "CANCELLED":
+                    raise
+            except Exception:
+                pass
+            update(job, 5, "Link media chưa tải được từ Colab. Đang thử bộ tải Douyin…")
+        from yt_dlp import YoutubeDL
+        cookie_file.write_text(cookie_text, encoding="utf-8")
         with YoutubeDL(options) as downloader:
             info = downloader.extract_info(job["canonical_url"], download=True)
             path = Path(downloader.prepare_filename(info))
@@ -122,10 +204,12 @@ def download_douyin(job: dict) -> Path:
         if not path.exists(): raise RuntimeError("Không tìm thấy file đã tải.")
         return path
     except Exception as error:
+        if isinstance(error, PipelineError) and error.code == "CANCELLED":
+            raise
         text = str(error).lower()
-        if "cookie" in text or "403" in text or "login" in text:
-            raise PipelineError("COOKIE_EXPIRED", "Cookie Douyin đã hết hạn hoặc bị từ chối.") from error
-        raise PipelineError("DOWNLOAD_FAILED", f"Không tải được video Douyin: {error}") from error
+        if any(marker in text for marker in ("fresh cookies", "403", "429", "verify", "captcha", "login", "sign in", "web detail json")):
+            raise PipelineError("DOUYIN_ACCESS_BLOCKED", "Douyin không trả dữ liệu video cho Colab; chưa thể kết luận cookie hết hạn. Hãy phát video rồi thử phân tích lại.") from error
+        raise PipelineError("DOWNLOAD_FAILED", "Không tải được video Douyin. Hãy mở lại video để cập nhật link media rồi thử lại.") from error
     finally:
         cookie_file.unlink(missing_ok=True)
 

@@ -1,8 +1,9 @@
 import { CanvasEditor } from "./canvas-editor.js";
 import { cookieSummary, deleteClone, listClones, saveClone } from "./storage.js";
+import { readPageMedia } from "./page-media.js";
 
 const $ = (selector) => document.querySelector(selector);
-const EXPECTED_API_VERSION = "1.5.6";
+const EXPECTED_API_VERSION = "1.5.7";
 const pageParams = new URLSearchParams(location.search);
 const isManualEditorPage = pageParams.get("manualEditor") === "1";
 const isReviewPlayerPage = pageParams.get("reviewPlayer") === "1";
@@ -12,7 +13,7 @@ if (isManualEditorPage) document.body.classList.add("manual-editor-page");
 if (isReviewPlayerPage) document.body.classList.add("review-player-page");
 const editor = new CanvasEditor($("#preview-canvas"));
 const state = {
-  canonicalUrl: "", server: null, jobId: null, stage: "idle", blurMode: "auto",
+  canonicalUrl: "", sourceTabId: null, mediaUrl: null, userAgent: "", server: null, jobId: null, stage: "idle", blurMode: "auto",
   clones: [], voices: [], analysis: null, pending: null, pollTimer: null, recoveryCount: 0, downloadId: null,
   speechRate: 1, previewRate: null, immutableReviews: false, renderConfig: null, uploadedClones: {},
   reviewResume: null, voiceCount: 1, voiceSelections: {},
@@ -204,11 +205,12 @@ function errorCode(error) {
 
 function friendlyError(error) {
   const messages = {
-    COOKIE_EXPIRED: "Cookie Douyin hiện tại không dùng được. Hãy đăng nhập lại Douyin rồi thử lại.",
+    COOKIE_EXPIRED: "Douyin yêu cầu xác thực phiên tải. Hãy mở lại video trên Douyin rồi thử lại.",
     COOKIE_CAPTURE_FAILED: "Không tự đọc được cookie Douyin. Hãy đăng nhập Douyin, nạp lại extension rồi thử lại.",
     INVALID_GEMINI_KEY: "Gemini API key không hợp lệ hoặc đã bị khóa. Hãy thay key mới.",
     GPU_UNAVAILABLE: "Colab không cấp được GPU T4. Có thể tài khoản đã hết hạn mức GPU.",
-    DOWNLOAD_FAILED: "Không tải được video Douyin. Hãy làm mới cookie rồi thử lại.",
+    DOWNLOAD_FAILED: "Không tải được video Douyin. Hãy mở lại video và thử lại; nếu vẫn lỗi, Colab có thể đang bị Douyin từ chối tải.",
+    DOUYIN_ACCESS_BLOCKED: "Douyin từ chối yêu cầu tải từ Colab hoặc không trả dữ liệu video. Điều này không có nghĩa cookie đăng nhập đã hết hạn. Hãy phát video vài giây rồi bấm phân tích lại để lấy link media mới.",
     TUNNEL_DISCONNECTED: "Phiên Colab đã ngắt. Extension sẽ khởi động lại khi bạn bấm nút.",
     JOB_NOT_FOUND: "Runtime Colab đã khởi động lại nên job cũ không còn. Hãy chạy lại video.",
     NO_SPEECH: "Video không có lời thoại để lồng tiếng.",
@@ -254,11 +256,17 @@ async function checkServer(retries = 2) {
 }
 
 async function findCurrentVideo(preserveExisting = false) {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (preserveExisting && state.jobId) return true;
+  let [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if ((!tab || !/^https:\/\/([^/]+\.)?douyin\.com\//.test(tab.url || "")) && state.sourceTabId) {
+    tab = await chrome.tabs.get(state.sourceTabId).catch(() => null);
+  }
+  state.mediaUrl = null;
+  state.userAgent = "";
   if (!tab?.id || !/^https:\/\/([^/]+\.)?douyin\.com\//.test(tab.url || "")) {
     if (!preserveExisting) state.canonicalUrl = "";
     $("#video-url").textContent = state.canonicalUrl || "Hãy mở một video trên douyin.com";
-    return;
+    return false;
   }
   try {
     let result;
@@ -270,11 +278,24 @@ async function findCurrentVideo(preserveExisting = false) {
     }
     if (!result?.ok) throw new Error(result?.error);
     state.canonicalUrl = result.canonicalUrl;
+    state.sourceTabId = tab.id;
+    state.mediaUrl = result.mediaUrl || null;
+    state.userAgent = result.userAgent || "";
+    if (!state.mediaUrl) {
+      // MSE players expose blob: URLs; find the matching video record in page data.
+      const videoId = result.canonicalUrl.split("/").pop();
+      const extracted = await chrome.scripting.executeScript({
+        target: { tabId: tab.id }, world: "MAIN", func: readPageMedia, args: [videoId],
+      }).catch(() => []);
+      state.mediaUrl = extracted[0]?.result?.mediaUrl || null;
+    }
     $("#video-url").textContent = result.canonicalUrl;
+    return true;
   } catch (error) {
     if (!preserveExisting) state.canonicalUrl = "";
     $("#video-url").textContent = state.canonicalUrl || "Không tìm thấy video đang phát";
     if (!state.canonicalUrl) setStatus(error.message || "Tải lại trang Douyin rồi thử lại.");
+    return false;
   }
 }
 
@@ -356,7 +377,7 @@ function rebuildVoiceSlots() {
 
 async function storePending(action) {
   state.pending = action;
-  await chrome.storage.session.set({ pendingAction: { action, canonicalUrl: state.canonicalUrl, blurMode: state.blurMode, createdAt: Date.now() } });
+  await chrome.storage.session.set({ pendingAction: { action, canonicalUrl: state.canonicalUrl, sourceTabId: state.sourceTabId, blurMode: state.blurMode, createdAt: Date.now() } });
 }
 
 async function clearPending() {
@@ -367,7 +388,7 @@ async function clearPending() {
 async function persistJob() {
   if (!state.jobId) return chrome.storage.session.remove("activeJob");
   return chrome.storage.session.set({ activeJob: {
-    jobId: state.jobId, canonicalUrl: state.canonicalUrl, stage: state.stage,
+    jobId: state.jobId, canonicalUrl: state.canonicalUrl, sourceTabId: state.sourceTabId, stage: state.stage,
     blurMode: state.blurMode, voiceCount: state.voiceCount,
     recoveryCount: state.recoveryCount, speechRate: state.speechRate,
     renderConfig: state.renderConfig, updatedAt: Date.now(),
@@ -439,7 +460,7 @@ async function ensureServer(action) {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.6 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.7 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
@@ -457,9 +478,10 @@ async function ensureServer(action) {
 }
 
 async function analyze() {
-  if (!state.canonicalUrl) {
-    await findCurrentVideo();
-    if (!state.canonicalUrl) return;
+  if (!await findCurrentVideo()) {
+    setBusy(false);
+    setStatus("Hãy mở video cần xử lý trên Douyin rồi bấm phân tích lại.");
+    return;
   }
   const saved = await chrome.storage.local.get(["geminiKey"]);
   if (!saved.geminiKey) {
@@ -482,6 +504,7 @@ async function analyze() {
       method: "POST",
       body: JSON.stringify({
         canonicalUrl: state.canonicalUrl, cookieText,
+        mediaUrl: state.mediaUrl, browserUserAgent: state.userAgent,
         geminiApiKey: saved.geminiKey, blurMode: state.blurMode, voiceCount: state.voiceCount,
       }),
     });
@@ -721,6 +744,7 @@ async function initialize() {
   const restored = session.activeJob || session.pendingAction;
   if (restored) {
     state.canonicalUrl = restored.canonicalUrl || "";
+    state.sourceTabId = restored.sourceTabId || null;
     state.blurMode = restored.blurMode || "auto";
     state.voiceCount = Math.max(1, Math.min(4, Number(restored.voiceCount || state.voiceCount)));
     $("#voice-count").value = String(state.voiceCount);
@@ -765,7 +789,7 @@ async function initialize() {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.6 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.7 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
