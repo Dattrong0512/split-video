@@ -13,7 +13,7 @@ from backend.pipeline import (
     _old_ocr_rows, _screen_subtitle_text, _translation_cue_payload, _translation_prompt, _translation_schema,
     _v3_ocr_boxes, _v3_ocr_rows, audio_mix_filter, cluster_rectangles, encoding_options, media_duration,
     ensure_portrait_subtitle_blur, gemini_translate, plan_dubbing_timeline, transcribe,
-    render_job, repeated_tts_tail_cutoff, separate_background, synthesize_cue, synthesize_verified_clone, tts_text_score,
+    create_dubbing, render_job, repeated_tts_tail_cutoff, separate_background, synthesize_cue, synthesize_verified_clone, tts_text_score,
     video_filter, write_ass,
 )
 
@@ -345,16 +345,18 @@ class PipelineHelpersTest(unittest.TestCase):
 
     def test_dubbing_speed_is_bounded_and_close_cues_do_not_overlap(self):
         cues = [{"start": 0, "end": 1}, {"start": 1.05, "end": 1.5}, {"start": 3, "end": 3.3}]
-        timeline = plan_dubbing_timeline(cues, [2.5, .2, .3], 4)
-        self.assertTrue(all(.90 <= item["speed"] <= 1.15 for item in timeline))
+        timeline = plan_dubbing_timeline(cues, [1.0, .4, .3], 4)
+        self.assertTrue(all(.75 <= item["speed"] <= 1.08 for item in timeline))
+        self.assertEqual([item["start"] for item in timeline], [0, 1.05, 3])
         self.assertGreaterEqual(timeline[1]["start"], timeline[0]["end"] + .04 - 1e-9)
         self.assertGreaterEqual(timeline[2]["start"], timeline[1]["end"] + .04 - 1e-9)
 
-    def test_short_and_long_tts_for_one_character_share_a_natural_speed(self):
+    def test_each_cue_matches_source_pace_instead_of_character_average(self):
         cues = [{"start": 0, "end": 2}, {"start": 2.1, "end": 3}]
-        timeline = plan_dubbing_timeline(cues, [.3, 3], 3.2)
-        self.assertAlmostEqual(timeline[0]["speed"], timeline[1]["speed"])
-        self.assertTrue(.95 <= timeline[0]["speed"] <= 1.08)
+        timeline = plan_dubbing_timeline(cues, [1.5, .95], 3.2)
+        self.assertAlmostEqual(timeline[0]["speed"], .75)
+        self.assertAlmostEqual(timeline[0]["end"], 2)
+        self.assertAlmostEqual(timeline[1]["end"], 3)
 
     def test_automatic_speed_does_not_exceed_natural_limit_to_force_exact_fit(self):
         cue = [{"start": 1, "end": 3}]
@@ -370,16 +372,43 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(faster["speed"], 1.296)
         self.assertLess(faster["end"], normal["end"])
 
-    def test_each_character_uses_one_uniform_automatic_speech_rate(self):
+    def test_other_characters_do_not_change_a_cues_timing(self):
         cues = [
             {"start": 0, "end": 1, "speaker": "S1"},
             {"start": 1.5, "end": 3.5, "speaker": "S1"},
             {"start": 4, "end": 5, "speaker": "S2"},
         ]
-        timeline = plan_dubbing_timeline(cues, [.5, 3.0, 1.0], 6)
+        timeline = plan_dubbing_timeline(cues, [.8, 2.0, 1.0], 6)
 
-        self.assertAlmostEqual(timeline[0]["speed"], timeline[1]["speed"])
-        self.assertTrue(all(.90 <= item["speed"] <= 1.15 for item in timeline))
+        self.assertEqual([item["start"] for item in timeline], [0, 1.5, 4])
+        self.assertAlmostEqual(timeline[0]["speed"], .8)
+        self.assertAlmostEqual(timeline[1]["speed"], 1)
+
+    def test_preview_cutoff_does_not_change_timing_or_speed(self):
+        cues = [{"start": 28, "end": 31}, {"start": 31.1, "end": 33}]
+        full = plan_dubbing_timeline(cues, [3.2, 2], 40)
+        preview = plan_dubbing_timeline(cues[:1], [3.2], 40, next_cue_start=31.1)
+        self.assertEqual(preview[0], full[0])
+        self.assertGreater(preview[0]["end"], 30)
+
+    def test_long_cue_never_pushes_following_dialogue_or_gets_cut_off(self):
+        for cues, durations, end in [
+            ([{"start": 0, "end": 1}, {"start": 1.05, "end": 2}], [2.5, 1], 3),
+            ([{"start": 9, "end": 10}], [2], 10),
+        ]:
+            with self.subTest(cues=cues), self.assertRaises(PipelineError) as raised:
+                plan_dubbing_timeline(cues, durations, end)
+            self.assertEqual(raised.exception.code, "TTS_TIMING_OVERFLOW")
+
+    def test_invalid_timing_and_speed_fail_without_hanging(self):
+        for speed in [0, -1, float("nan"), float("inf")]:
+            with self.subTest(speed=speed), self.assertRaises(ValueError):
+                _atempo(speed)
+        for duration in [0, -1, float("nan"), float("inf")]:
+            with self.subTest(duration=duration), self.assertRaises(ValueError):
+                plan_dubbing_timeline([{"start": 0, "end": 1}], [duration], 2)
+        with self.assertRaises(ValueError):
+            plan_dubbing_timeline([{"start": 2, "end": 3}, {"start": 1, "end": 2}], [1, 1], 4)
 
     def test_clone_synthesis_uses_cue_duration_and_full_quality_steps(self):
         model = SimpleNamespace(
@@ -506,11 +535,45 @@ class PipelineHelpersTest(unittest.TestCase):
 
         self.assertEqual(attempted_durations, [None])
 
-    def test_overflowing_cues_compact_into_pauses_before_video_end(self):
+    def test_clone_retries_abnormally_fast_or_long_take_with_source_duration(self):
+        for first_duration in [.4, 4]:
+            with self.subTest(first_duration=first_duration), TemporaryDirectory() as directory:
+                raw = Path(directory) / "raw.wav"
+                attempted = []
+
+                def synthesize(_text, _voice, path, _voices, target_duration=None):
+                    attempted.append(target_duration)
+                    path.write_bytes(str(target_duration).encode())
+
+                with patch("backend.pipeline.synthesize_cue", side_effect=synthesize), \
+                        patch("backend.pipeline.trim_repeated_tts_tail"), \
+                        patch("backend.pipeline.tts_transcript_score", return_value=.95), \
+                        patch("backend.pipeline.media_duration", side_effect=[first_duration, 2]):
+                    synthesize_verified_clone("Câu đầy đủ.", "clone:test", raw, {}, 2, timing_window=2.2)
+                self.assertEqual(attempted, [None, 2])
+                self.assertEqual(raw.read_bytes(), b"2")
+
+    def test_duration_controlled_clone_cannot_bypass_transcript_verification(self):
+        with TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw.wav"
+
+            def synthesize(_text, _voice, path, _voices, target_duration=None):
+                path.write_bytes(b"complete" if target_duration is None else b"missing-ending")
+
+            with patch("backend.pipeline.synthesize_cue", side_effect=synthesize), \
+                    patch("backend.pipeline.trim_repeated_tts_tail"), \
+                    patch("backend.pipeline.tts_transcript_score", side_effect=[.95, .5, .7]), \
+                    patch("backend.pipeline.media_duration", return_value=4):
+                synthesize_verified_clone("Câu đầy đủ.", "clone:test", raw, {}, 2, timing_window=2.2)
+            # The full take is retained for a manual speed/voice adjustment;
+            # the timeline gate rejects it if it still cannot fit.
+            self.assertEqual(raw.read_bytes(), b"complete")
+
+    def test_small_overflow_borrows_a_pause_without_moving_source_start(self):
         cues = [{"start": 1, "end": 2}, {"start": 4, "end": 4.5}]
-        timeline = plan_dubbing_timeline(cues, [2, 2], 5)
+        timeline = plan_dubbing_timeline(cues, [1.3, .7], 5)
         self.assertLessEqual(timeline[-1]["end"], 5)
-        self.assertGreaterEqual(timeline[0]["start"], 0)
+        self.assertEqual([item["start"] for item in timeline], [1, 4])
         self.assertGreaterEqual(timeline[1]["start"], timeline[0]["end"] + .04 - 1e-9)
         self.assertTrue(all(item["speed"] <= 1.15 for item in timeline))
 
@@ -578,6 +641,36 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertEqual(options[options.index("-t") + 1], "74.100")
         self.assertEqual(options[options.index("-maxrate") + 1], "3000k")
         self.assertEqual(options[options.index("-b:a") + 1], "128k")
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required for render integration")
+    def test_preview_audio_matches_full_export_across_thirty_second_boundary(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = {"work_dir": root, "duration": 40, "cues": [
+                {"id": 0, "start": 28, "end": 31, "text_vi": "Một.", "speaker": "S1"},
+                {"id": 1, "start": 31.2, "end": 33.2, "text_vi": "Hai.", "speaker": "S1"},
+            ]}
+            request = SimpleNamespace(voiceMap={"*": "edge:test"}, speechRate=1)
+
+            def synthesize(_text, _voice, raw, _voices, target_duration=None):
+                subprocess.run([
+                    shutil.which("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", f"sine=frequency=660:duration={target_duration}",
+                    "-ar", "24000", "-ac", "1", str(raw),
+                ], check=True)
+
+            with patch("backend.pipeline.synthesize_cue", side_effect=synthesize) as generate:
+                output, preview_cues = create_dubbing(job, request, {}, duration_limit=30)
+                from pydub import AudioSegment
+                with output.open("rb") as audio:
+                    preview_pcm = AudioSegment.from_wav(audio)[:30000].raw_data
+                output, full_cues = create_dubbing(job, request, {})
+                with output.open("rb") as audio:
+                    full_pcm = AudioSegment.from_wav(audio)[:30000].raw_data
+            self.assertEqual(preview_pcm, full_pcm)
+            self.assertEqual(preview_cues[0], full_cues[0])
+            self.assertEqual(preview_cues[0]["start"], 28)
+            self.assertEqual(generate.call_count, 2)
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required for render integration")
     def test_preview_then_full_render_reuses_synthesized_voice(self):

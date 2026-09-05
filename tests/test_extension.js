@@ -100,7 +100,7 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   const sessionWrites = [];
   const event = () => ({ addListener: () => {} });
   const context = {
-    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.5" }) }),
+    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.6" }) }),
     AbortSignal: { timeout: () => ({}) },
     setTimeout: (callback) => { callback(); return 1; },
     chrome: {
@@ -145,8 +145,8 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   };
   vm.runInNewContext(fs.readFileSync("extension/service-worker.js", "utf8"), context);
   assert.equal(typeof updateAvailableListener, "function");
-  await updateAvailableListener({ version: "1.5.5" });
-  assert.ok(sessionWrites.some((value) => value.extensionUpdate?.version === "1.5.5"));
+  await updateAvailableListener({ version: "1.5.6" });
+  assert.ok(sessionWrites.some((value) => value.extensionUpdate?.version === "1.5.6"));
   const response = await new Promise((resolve) => {
     assert.equal(runtimeListener({ type: "OPEN_COLAB" }, {}, resolve), true);
   });
@@ -223,9 +223,64 @@ async function testCanvasEditorWaitsForDecodedVideoFrame() {
   assert.equal(video.hidden, false);
 }
 
+function sidepanelFunction(name, followingName) {
+  const source = fs.readFileSync("extension/sidepanel.js", "utf8");
+  return source.slice(source.indexOf(`async function ${name}(`), source.indexOf(`\n${followingName}`));
+}
+
+async function testReviewLoadingHandlesErrorsAndResetsPlaybackSpeed() {
+  for (const event of ["loadedmetadata", "error", "timeout"]) {
+    const listeners = new Map();
+    let timeoutCallback;
+    let cleared = false;
+    const video = {
+      hidden: true, currentTime: 0, duration: 30, playbackRate: 1.4,
+      addEventListener: (name, fn) => listeners.set(name, fn),
+      removeEventListener: (name) => listeners.delete(name),
+      load: () => event === "timeout" ? timeoutCallback() : listeners.get(event)(),
+    };
+    const state = { speechRate: 1.4, reviewResume: null };
+    const context = {
+      state, $: (selector) => selector === "#review-video" ? video : {},
+      serverFetch: async () => ({ url: "https://preview.example", speechRate: 1, seconds: 30 }),
+      setTimeout: (fn) => { timeoutCallback = fn; return 42; },
+      clearTimeout: (id) => { assert.equal(id, 42); cleared = true; },
+      showSpeedCard() {}, setBusy() {}, setStatus() {}, persistJob: async () => {},
+    };
+    vm.runInNewContext(sidepanelFunction("showDubbingReview", "function invalidateDubbingReview"), context);
+    if (event === "loadedmetadata") {
+      await context.showDubbingReview();
+      assert.equal(state.stage, "preview_ready");
+      assert.equal(state.speechRate, 1);
+    } else {
+      await assert.rejects(context.showDubbingReview(), /Không tải được preview/);
+    }
+    assert.equal(video.playbackRate, 1);
+    assert.equal(listeners.size, 0);
+    assert.ok(cleared);
+  }
+}
+
+async function testCancelledPollCannotRestartTheOldJob() {
+  let respond;
+  const state = { jobId: "old-job" };
+  const context = {
+    state, clearTimeout() {},
+    serverFetch: () => new Promise((resolve) => { respond = resolve; }),
+    setStatus: () => { throw new Error("Stale poll must not update UI"); },
+  };
+  vm.runInNewContext(sidepanelFunction("pollJob", "async function uploadClone"), context);
+  const polling = context.pollJob();
+  state.jobId = null;
+  respond({ status: "analysis_ready" });
+  await polling;
+}
+
 Promise.all([
   testServiceWorkerReinjectsExistingColabTab(),
   testCanvasEditorWaitsForDecodedVideoFrame(),
+  testReviewLoadingHandlesErrorsAndResetsPlaybackSpeed(),
+  testCancelledPollCannotRestartTheOldJob(),
 ])
   .then(() => {
     const sidepanel = fs.readFileSync("extension/sidepanel.js", "utf8");

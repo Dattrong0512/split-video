@@ -2,7 +2,7 @@ import { CanvasEditor } from "./canvas-editor.js";
 import { cookieSummary, deleteClone, listClones, saveClone } from "./storage.js";
 
 const $ = (selector) => document.querySelector(selector);
-const EXPECTED_API_VERSION = "1.5.5";
+const EXPECTED_API_VERSION = "1.5.6";
 const pageParams = new URLSearchParams(location.search);
 const isManualEditorPage = pageParams.get("manualEditor") === "1";
 const isReviewPlayerPage = pageParams.get("reviewPlayer") === "1";
@@ -107,7 +107,9 @@ function showSpeedCard() {
 }
 
 async function showDubbingReview() {
-  const review = await serverFetch(`/api/jobs/${state.jobId}/review-token`, { method: "POST" });
+  const reviewJobId = state.jobId;
+  const review = await serverFetch(`/api/jobs/${reviewJobId}/review-token`, { method: "POST" });
+  if (state.jobId !== reviewJobId) return;
   const video = $("#review-video");
   const resume = state.reviewResume ? { ...state.reviewResume } : null;
   if (resume?.shouldPlay && !video.hidden && Number.isFinite(video.currentTime)) {
@@ -116,14 +118,23 @@ async function showDubbingReview() {
   video.defaultPlaybackRate = 1;
   video.playbackRate = 1;
   video.preservesPitch = true;
-  video.src = review.url;
   video.hidden = false;
   $("#open-large-review").hidden = false;
-  video.load();
-  await new Promise((resolve) => {
-    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) resolve();
-    else video.addEventListener("loadedmetadata", resolve, { once: true });
+  await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      video.removeEventListener("loadedmetadata", loaded);
+      video.removeEventListener("error", failed);
+    };
+    const loaded = () => { cleanup(); resolve(); };
+    const failed = () => { cleanup(); reject(new Error("Không tải được preview. Hãy mở lại bảng điều khiển để thử lại.")); };
+    const timer = setTimeout(failed, 30000);
+    video.addEventListener("loadedmetadata", loaded, { once: true });
+    video.addEventListener("error", failed, { once: true });
+    video.src = review.url;
+    video.load();
   });
+  if (state.jobId !== reviewJobId) return;
   if (resume && Number.isFinite(resume.currentTime)) {
     video.currentTime = Math.min(Math.max(0, resume.currentTime), Math.max(0, video.duration - .05));
   }
@@ -428,7 +439,7 @@ async function ensureServer(action) {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.5 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.6 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
@@ -541,16 +552,40 @@ async function recoverDisconnectedWorkflow(error) {
 
 async function pollJob() {
   clearTimeout(state.pollTimer);
+  const polledJobId = state.jobId;
+  if (!polledJobId) return;
   try {
-    const job = await serverFetch(`/api/jobs/${state.jobId}`);
+    const job = await serverFetch(`/api/jobs/${polledJobId}`);
+    if (state.jobId !== polledJobId) return;
     if (job.analysis) state.analysis = job.analysis;
     setStatus(job.message || "Đang xử lý…", job.progress || 0);
-    if (job.status === "analysis_ready") return applyAnalysis(job.analysis);
-    if (job.status === "preview_ready") return showDubbingReview();
-    if (job.status === "complete") return downloadResult();
+    if (job.status === "analysis_ready") return await applyAnalysis(job.analysis);
+    if (job.status === "preview_ready") {
+      try { await showDubbingReview(); }
+      catch (error) {
+        if (state.jobId !== polledJobId) return;
+        state.stage = "ready";
+        invalidateDubbingReview();
+        showSpeedCard();
+        setBusy(false);
+        setStatus(friendlyError(error));
+      }
+      return;
+    }
+    if (job.status === "complete") return await downloadResult();
+    if (job.status === "render_retry") {
+      state.stage = "ready";
+      invalidateDubbingReview();
+      showSpeedCard();
+      setBusy(false);
+      setStatus(friendlyError(job.error));
+      await persistJob();
+      return;
+    }
     if (job.status === "failed" || job.status === "cancelled") throw job.error || { message: job.message };
     state.pollTimer = setTimeout(pollJob, 1500);
   } catch (error) {
+    if (state.jobId !== polledJobId) return;
     if (await recoverDisconnectedWorkflow(error)) return;
     setBusy(false);
     state.stage = "idle";
@@ -730,7 +765,7 @@ async function initialize() {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.5 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.6 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));

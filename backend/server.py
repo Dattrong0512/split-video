@@ -27,7 +27,7 @@ JOBS: dict[str, dict] = {}
 VOICES: dict[str, dict] = {}
 LOCK = threading.RLock()
 
-app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.5.5", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.5.6", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
@@ -45,7 +45,7 @@ def authorize(authorization: str | None = Header(default=None)) -> None:
 def public_job(job: dict) -> dict:
     private = {
         "gemini_key", "cookie_text", "download_token", "download_expires",
-        "preview_token", "preview_expires", "review_token", "review_expires",
+        "preview_token", "preview_expires", "review_token", "review_expires", "review_links",
         "work_dir", "source", "browser_preview", "cues", "result", "review_result", "tts_cache", "background",
     }
     return {key: value for key, value in job.items() if key not in private}
@@ -72,13 +72,18 @@ def run_render(job_id: str, request: RenderRequest) -> None:
     try:
         render_job(JOBS[job_id], request, VOICES)
     except Exception as error:
+        job = JOBS.get(job_id)
+        if isinstance(error, PipelineError) and error.code == "TTS_TIMING_OVERFLOW" and job and not job.get("cancelled"):
+            # Keep the analysis and verified TTS so the user can adjust and retry.
+            job.update(status="render_retry", message=str(error), error={"code": error.code, "message": str(error)})
+            return
         fail_job(job_id, error)
 
 
 @app.get("/api/health", dependencies=[Depends(authorize)])
 def health() -> dict:
     return {
-        "ok": True, "apiVersion": "1.5.5",
+        "ok": True, "apiVersion": "1.5.6",
         "immutableReviews": True,
         "voices": [
             {"id": "edge:vi-VN-HoaiMyNeural", "name": "Hoài My · Nữ"},
@@ -146,7 +151,7 @@ def start_render(job_id: str, request: RenderRequest) -> dict:
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail={"code": "JOB_NOT_FOUND", "message": "Không tìm thấy job."})
-    if job["status"] not in {"analysis_ready", "preview_ready"}:
+    if job["status"] not in {"analysis_ready", "preview_ready", "render_retry"}:
         raise HTTPException(status_code=409, detail={"code": "JOB_NOT_READY", "message": "Job chưa phân tích xong."})
     voice_count = max(1, min(4, int(job.get("voice_count", 1))))
     expected_speakers = {"*"} if voice_count == 1 else {f"S{index}" for index in range(1, voice_count + 1)}
@@ -155,6 +160,7 @@ def start_render(job_id: str, request: RenderRequest) -> dict:
             "code": "INVALID_VOICE_MAP",
             "message": f"Cấu hình phải có đúng {voice_count} giọng khác nhau.",
         })
+    job.pop("error", None)
     if request.previewOnly:
         job.update(status="queued_preview", message="Đang chuẩn bị bản xem trước 30 giây…", progress=56)
     else:
@@ -195,8 +201,11 @@ def create_review_token(job_id: str) -> dict:
     if not job or job.get("status") != "preview_ready" or not result or not result.exists():
         raise HTTPException(status_code=409, detail={"code": "REVIEW_NOT_READY", "message": "Bản xem trước chưa sẵn sàng."})
     token = secrets.token_urlsafe(24)
-    job["review_token"] = token
-    job["review_expires"] = time.time() + 7200
+    now = time.time()
+    links = job.setdefault("review_links", {})
+    for expired in [key for key, value in links.items() if value["expires"] < now]:
+        del links[expired]
+    links[token] = {"path": result, "expires": now + 7200}
     return {"url": f"{PUBLIC_URL}/api/reviews/{job_id}?token={token}", "seconds": min(30, float(job["duration"])),
             "speechRate": job.get("review_rate", 1.0)}
 
@@ -204,10 +213,11 @@ def create_review_token(job_id: str) -> dict:
 @app.get("/api/reviews/{job_id}")
 def review_video(job_id: str, token: str):
     job = JOBS.get(job_id)
-    if not job or token != job.get("review_token") or time.time() > job.get("review_expires", 0):
+    link = job.get("review_links", {}).get(token) if job else None
+    if not link or time.time() > link["expires"] or not Path(link["path"]).exists():
         raise HTTPException(status_code=403, detail="Liên kết bản xem trước không hợp lệ hoặc đã hết hạn.")
     return FileResponse(
-        job["review_result"], media_type="video/mp4", filename="review-30s.mp4",
+        link["path"], media_type="video/mp4", filename="review-30s.mp4",
         content_disposition_type="inline", headers={"Cache-Control": "private, max-age=3600"},
     )
 

@@ -26,7 +26,9 @@ class PipelineError(RuntimeError):
 _whisper_model = None
 _omnivoice_model = None
 _ocr_model = None
-TTS_CACHE_VERSION = 7
+TTS_CACHE_VERSION = 8
+MIN_AUTO_SPEED = .75
+MAX_AUTO_SPEED = 1.08
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
@@ -586,6 +588,8 @@ def probe_reference(path: Path) -> tuple[str, float]:
 
 
 def _atempo(speed: float) -> str:
+    if not math.isfinite(speed) or speed <= 0:
+        raise ValueError("Tốc độ âm thanh phải là số dương hữu hạn")
     parts = []
     while speed > 2: parts.append("atempo=2"); speed /= 2
     while speed < .5: parts.append("atempo=.5"); speed /= .5
@@ -717,18 +721,32 @@ def tts_transcript_score(path: Path, text: str) -> float:
 
 def synthesize_verified_clone(
     text: str, voice: str, raw: Path, voices: dict, target_duration: float,
-    attempts: int = 3,
+    attempts: int = 3, timing_window: float | None = None,
 ) -> tuple[float, bool]:
     candidates = []
     best_path = None
     best_score = -1.0
+    best_distance = math.inf
     try:
         for attempt in range(attempts):
             candidate = raw.with_name(f"{raw.stem}-attempt-{attempt + 1}.wav")
             candidates.append(candidate)
-            synthesize_cue(text, voice, candidate, voices, target_duration=None)
+            # Retry duration-controlled generation only after hearing a natural take.
+            synthesize_cue(text, voice, candidate, voices,
+                           target_duration=target_duration if timing_window is not None and attempt else None)
             trim_repeated_tts_tail(candidate, text)
             score = tts_transcript_score(candidate, text)
+            if score >= .86 and timing_window is not None:
+                duration = media_duration(candidate)
+                distance = abs(duration - target_duration)
+                if best_score < .86 or distance < best_distance:
+                    best_path, best_score, best_distance = candidate, score, distance
+                if duration > timing_window * MAX_AUTO_SPEED:
+                    continue
+                if duration < target_duration * MIN_AUTO_SPEED and attempt < attempts - 1:
+                    continue
+                best_path, best_score = candidate, score
+                break
             if score > best_score:
                 best_path, best_score = candidate, score
             if score >= .86:
@@ -747,41 +765,54 @@ def synthesize_verified_clone(
 
 def plan_dubbing_timeline(
     cues: list[dict], generated_durations: list[float], video_duration: float,
-    gap: float = .04, speech_rate: float = 1.0,
+    gap: float = .04, speech_rate: float = 1.0, next_cue_start: float | None = None,
 ) -> list[dict]:
     if len(cues) != len(generated_durations):
         raise ValueError("Mỗi cue phải có đúng một audio TTS")
-    speaker_totals = {}
-    for cue, generated in zip(cues, generated_durations):
-        speaker = str(cue.get("speaker") or "S1")
-        totals = speaker_totals.setdefault(speaker, {"generated": 0.0, "source": 0.0})
-        totals["generated"] += max(.05, float(generated))
-        totals["source"] += max(.25, float(cue["end"]) - float(cue["start"]))
-    automatic_speeds = {
-        speaker: min(1.08, max(.95, totals["generated"] / totals["source"]))
-        for speaker, totals in speaker_totals.items()
-    }
+    if not math.isfinite(speech_rate) or not .8 <= speech_rate <= 1.4:
+        raise ValueError("Tốc độ giọng phải nằm trong khoảng 0,80–1,40")
+    windows = dubbing_windows(cues, video_duration, gap, next_cue_start)
     timeline = []
-    cursor = 0.0
-    for cue, generated in zip(cues, generated_durations):
-        start = max(float(cue["start"]), cursor)
-        generated = max(.05, float(generated))
-        automatic_speed = automatic_speeds[str(cue.get("speaker") or "S1")]
-        speed = min(1.5, max(.72, automatic_speed * speech_rate))
+    for index, (cue, generated, window) in enumerate(zip(cues, generated_durations, windows)):
+        start = float(cue["start"])
+        generated = float(generated)
+        if not math.isfinite(generated) or generated <= 0:
+            raise ValueError("Audio TTS phải có thời lượng dương hữu hạn")
+        target = min(float(cue["end"]) - start, window)
+        automatic_speed = min(MAX_AUTO_SPEED, max(MIN_AUTO_SPEED, generated / target))
+        speed = automatic_speed * speech_rate
         end = start + generated / speed
+        if end > start + window + .001:
+            raise PipelineError(
+                "TTS_TIMING_OVERFLOW",
+                f"Câu {index + 1} tại {start:.2f}s cần {generated / speed:.2f}s nhưng chỉ có {window:.2f}s. "
+                "Hãy chọn giọng khác hoặc tăng nhẹ tốc độ rồi tạo lại preview.",
+            )
         timeline.append({"start": start, "end": end, "speed": speed})
-        cursor = end + gap
-    if timeline and timeline[-1]["end"] > video_duration:
-        compacted = [dict(item) for item in timeline]
-        latest_end = video_duration
-        for item in reversed(compacted):
-            speech_duration = item["end"] - item["start"]
-            item["end"] = min(item["end"], latest_end)
-            item["start"] = item["end"] - speech_duration
-            latest_end = item["start"] - gap
-        if compacted[0]["start"] >= 0:
-            timeline = compacted
     return timeline
+
+
+def dubbing_windows(cues: list[dict], video_duration: float, gap: float = .04,
+                    next_cue_start: float | None = None) -> list[float]:
+    if not math.isfinite(video_duration) or video_duration <= 0 or not math.isfinite(gap) or gap < 0:
+        raise ValueError("Thời lượng video hoặc khoảng nghỉ không hợp lệ")
+    windows = []
+    for index, cue in enumerate(cues):
+        start, end = float(cue["start"]), float(cue["end"])
+        if not all(math.isfinite(value) for value in (start, end)) or start < 0 or end <= start or start >= video_duration:
+            raise ValueError("Timestamp lời thoại không hợp lệ")
+        boundary = float(cues[index + 1]["start"]) if index + 1 < len(cues) else (
+            video_duration if next_cue_start is None else float(next_cue_start))
+        if not math.isfinite(boundary) or boundary <= start:
+            raise ValueError("Các câu phải được sắp theo thời gian tăng dần")
+        # Preserve scene timing; borrow at most half a second of a real pause.
+        # Leave a small guard for FFmpeg's sample-level duration rounding.
+        available_end = min(video_duration, end + .5, boundary - gap)
+        window = available_end - start
+        if window <= 0:
+            raise PipelineError("TTS_TIMING_OVERFLOW", f"Các câu quá sát nhau tại {start:.2f}s.")
+        windows.append(window)
+    return windows
 
 
 def _omnivoice():
@@ -821,7 +852,10 @@ def create_dubbing(job: dict, request, voices: dict, duration_limit: float | Non
     from pydub import AudioSegment
     AudioSegment.converter = ffmpeg()
     directory: Path = job["work_dir"] / "tts"; directory.mkdir(exist_ok=True)
-    cues = [dict(cue) for cue in job["cues"] if duration_limit is None or float(cue["start"]) < duration_limit]
+    all_cues = job["cues"]
+    all_windows = dubbing_windows(all_cues, float(job["duration"]))
+    cues = [dict(cue) for cue in all_cues if duration_limit is None or float(cue["start"]) < duration_limit]
+    windows = all_windows[:len(cues)]
     total = len(cues)
     cache = job.setdefault("tts_cache", {})
     generated_files = []
@@ -834,23 +868,29 @@ def create_dubbing(job: dict, request, voices: dict, duration_limit: float | Non
         cached = cache.get(cache_key, {})
         raw = directory / f"raw-{int(cue['id']):04d}.wav"
         if (cached.get("version") != TTS_CACHE_VERSION or cached.get("voice") != voice
-                or cached.get("text") != cue["text_vi"] or not raw.exists()):
+                or cached.get("text") != cue["text_vi"] or cached.get("window") != windows[index - 1]
+                or cached.get("source_duration") != float(cue["end"]) - float(cue["start"]) or not raw.exists()):
             update(job, 62 + index / max(1, total) * 12, f"Đang tạo giọng Việt {index}/{total} ({cue['speaker']})…")
             cue_duration = max(.35, float(cue["end"]) - float(cue["start"]))
             if voice.startswith("clone:"):
                 synthesize_verified_clone(
                     cue["text_vi"], voice, raw, voices, cue_duration,
+                    timing_window=windows[index - 1],
                 )
             else:
                 synthesize_cue(cue["text_vi"], voice, raw, voices, target_duration=cue_duration)
             cache[cache_key] = {
                 "version": TTS_CACHE_VERSION, "voice": voice,
                 "text": cue["text_vi"], "duration": media_duration(raw),
+                "window": windows[index - 1], "source_duration": float(cue["end"]) - float(cue["start"]),
             }
         generated_files.append(raw)
         generated_durations.append(float(cache[cache_key]["duration"]))
     output_duration = min(float(job["duration"]), duration_limit) if duration_limit is not None else float(job["duration"])
-    timeline = plan_dubbing_timeline(cues, generated_durations, output_duration, speech_rate=float(request.speechRate))
+    # A preview uses the same source boundaries as the full export, even at 30s.
+    next_start = float(all_cues[len(cues)]["start"]) if len(cues) < len(all_cues) else None
+    timeline = plan_dubbing_timeline(cues, generated_durations, float(job["duration"]),
+                                    speech_rate=float(request.speechRate), next_cue_start=next_start)
     rendered_segments = []
     for index, (cue, raw, timing) in enumerate(zip(cues, generated_files, timeline), 1):
         update(job, 74 + index / total * 4, f"Đang căn thời gian giọng Việt {index}/{total}…")
@@ -858,6 +898,8 @@ def create_dubbing(job: dict, request, voices: dict, duration_limit: float | Non
         run([ffmpeg(), "-y", "-i", str(raw), "-af", _atempo(timing["speed"]), "-ar", "24000", "-ac", "1", str(fitted)], "VOICE_FAILED")
         with fitted.open("rb") as fitted_stream:
             segment = AudioSegment.from_file(fitted_stream, format="wav").set_frame_rate(24000).set_channels(1)
+        if len(segment) / 1000 > windows[index - 1] + .02:
+            raise PipelineError("TTS_TIMING_OVERFLOW", f"Audio câu {index} vượt khoảng thời gian cho phép sau khi căn giọng.")
         cue["start"] = timing["start"]
         cue["end"] = timing["start"] + len(segment) / 1000
         cue["speech_speed"] = timing["speed"]

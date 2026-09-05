@@ -26,7 +26,7 @@ class ServerContractTest(unittest.TestCase):
     def test_health_lists_vietnamese_presets(self):
         response = self.client.get("/api/health", headers=self.auth)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["apiVersion"], "1.5.5")
+        self.assertEqual(response.json()["apiVersion"], "1.5.6")
         self.assertTrue(response.json()["immutableReviews"])
         self.assertEqual([voice["id"] for voice in response.json()["voices"]], [
             "edge:vi-VN-HoaiMyNeural", "edge:vi-VN-NamMinhNeural"
@@ -173,6 +173,45 @@ class ServerContractTest(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(server.JOBS[job_id]["status"], "queued_preview")
                 self.assertTrue(submit.call_args.args[2].previewOnly)
+            finally:
+                server.JOBS.pop(job_id, None)
+
+    def test_review_links_keep_their_audio_version_across_rerenders_and_tabs(self):
+        job_id = "immutable-review-test"
+        with TemporaryDirectory() as directory:
+            old = Path(directory) / "old.mp4"
+            new = Path(directory) / "new.mp4"
+            old.write_bytes(b"old-audio")
+            new.write_bytes(b"new-audio")
+            server.JOBS[job_id] = {"id": job_id, "status": "preview_ready", "review_result": old, "duration": 40}
+            try:
+                first = self.client.post(f"/api/jobs/{job_id}/review-token", headers=self.auth).json()["url"]
+                server.JOBS[job_id]["review_result"] = new
+                second = self.client.post(f"/api/jobs/{job_id}/review-token", headers=self.auth).json()["url"]
+                self.assertEqual(self.client.get(first).content, b"old-audio")
+                self.assertEqual(self.client.get(second).content, b"new-audio")
+                self.assertNotIn("review_links", server.public_job(server.JOBS[job_id]))
+                self.assertEqual(self.client.get(f"/api/reviews/{job_id}?token=wrong").status_code, 403)
+            finally:
+                server.JOBS.pop(job_id, None)
+
+    def test_timing_failure_preserves_analysis_and_allows_retry(self):
+        job_id = "timing-retry-test"
+        request = RenderRequest(voiceMap={"*": "edge:vi-VN-HoaiMyNeural"},
+                                subtitleRect={"x": .1, "y": .7, "w": .8, "h": .2}, previewOnly=True)
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            source.write_bytes(b"source")
+            server.JOBS[job_id] = {"id": job_id, "status": "rendering_preview", "work_dir": Path(directory)}
+            try:
+                with patch.object(server, "render_job", side_effect=server.PipelineError("TTS_TIMING_OVERFLOW", "Câu quá dài")):
+                    server.run_render(job_id, request)
+                self.assertEqual(server.JOBS[job_id]["status"], "render_retry")
+                self.assertTrue(source.exists())
+                with patch.object(server.EXECUTOR, "submit"):
+                    response = self.client.post(f"/api/jobs/{job_id}/render", headers=self.auth, json=request.model_dump())
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn("error", server.JOBS[job_id])
             finally:
                 server.JOBS.pop(job_id, None)
 
