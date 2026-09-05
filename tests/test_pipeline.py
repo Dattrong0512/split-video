@@ -496,25 +496,26 @@ class PipelineHelpersTest(unittest.TestCase):
         text = "Tôi không biết tại sao."
         self.assertEqual(tts_text_score(text, text), 1.0)
 
-    def test_bad_clone_attempts_fail_instead_of_switching_to_another_voice(self):
+    def test_low_whisper_scores_keep_best_clone_instead_of_blocking_render(self):
         with TemporaryDirectory() as directory:
             raw = Path(directory) / "raw.wav"
             attempted_voices = []
 
             def fake_synthesize(_text, voice, path, _voices, target_duration=None):
                 attempted_voices.append(voice)
-                path.write_bytes(b"clone")
+                path.write_bytes(f"clone-{len(attempted_voices)}".encode())
 
             with patch("backend.pipeline.synthesize_cue", side_effect=fake_synthesize), \
                     patch("backend.pipeline.trim_repeated_tts_tail", return_value=False), \
                     patch("backend.pipeline.tts_transcript_score", side_effect=[.31, .44, .38]):
-                with self.assertRaises(PipelineError) as raised:
-                    synthesize_verified_clone("Đây là câu đúng.", "clone:test", raw, {}, 1.2)
+                score, fallback = synthesize_verified_clone("Đây là câu đúng.", "clone:test", raw, {}, 1.2)
 
-            self.assertEqual(raised.exception.code, "VOICE_FAILED")
             self.assertEqual(attempted_voices, ["clone:test"] * 3)
+            self.assertAlmostEqual(score, .44)
+            self.assertFalse(fallback)
+            self.assertEqual(raw.read_bytes(), b"clone-2")
 
-    def test_borderline_incomplete_clone_is_not_accepted(self):
+    def test_borderline_whisper_result_is_accepted_after_retry(self):
         with TemporaryDirectory() as directory:
             raw = Path(directory) / "raw.wav"
 
@@ -524,8 +525,30 @@ class PipelineHelpersTest(unittest.TestCase):
             with patch("backend.pipeline.synthesize_cue", side_effect=fake_synthesize), \
                     patch("backend.pipeline.trim_repeated_tts_tail", return_value=False), \
                     patch("backend.pipeline.tts_transcript_score", side_effect=[.78, .80, .81]):
-                with self.assertRaises(PipelineError):
-                    synthesize_verified_clone("Câu này phải được đọc đầy đủ.", "clone:test", raw, {}, 2.0)
+                score, fallback = synthesize_verified_clone("Câu này phải được đọc đầy đủ.", "clone:test", raw, {}, 2.0)
+            self.assertAlmostEqual(score, .81)
+            self.assertFalse(fallback)
+            self.assertEqual(raw.read_bytes(), b"incomplete")
+
+    def test_clone_render_continues_when_whisper_recognizes_nothing(self):
+        with TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw.wav"
+            attempts = []
+
+            def fake_synthesize(_text, _voice, path, _voices, target_duration=None):
+                attempts.append(path.name)
+                path.write_bytes(f"audio-{len(attempts)}".encode())
+
+            with patch("backend.pipeline.synthesize_cue", side_effect=fake_synthesize), \
+                    patch("backend.pipeline.trim_repeated_tts_tail", return_value=False), \
+                    patch("backend.pipeline.tts_transcript_score", return_value=0):
+                score, fallback = synthesize_verified_clone(
+                    "Whisper có thể không nhận ra giọng này.", "clone:test", raw, {}, 2.0,
+                )
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(score, 0)
+            self.assertFalse(fallback)
+            self.assertEqual(raw.read_bytes(), b"audio-1")
 
     def test_verified_clone_is_used_without_fallback(self):
         with TemporaryDirectory() as directory:

@@ -29,9 +29,11 @@ Với voice clone, OmniVoice được tạo ở 32 bước. Chế độ kéo dà
 
 Mỗi link preview gắn với đúng bản âm thanh đã tạo, nên mở thêm tab hoặc tạo preview mới không làm thay đổi nội dung của link cũ. Lỗi tải preview có thời gian chờ tối đa 30 giây và cho phép thử lại.
 
-### Áp dụng bản sửa 1.5.9
+### Áp dụng bản sửa 1.5.10
 
 Notebook hiện lấy backend từ nhánh `main` của `Dattrong0512/split-video` trên GitHub. Thay đổi trong thư mục trên máy chưa tự cập nhật lên Colab: cần đưa bản sửa lên kho mã đó trước, chạy lại notebook và nạp lại extension. Nên nghe thử ở **1,00×** trước khi chỉnh thanh tốc độ. Kiểm thử cục bộ dùng audio tổng hợp; chất lượng và nhịp đọc của giọng clone cụ thể cần được nghe kiểm tra trên Colab.
+
+Bản 1.5.10 không còn hủy render chỉ vì Whisper chấm thấp giọng clone. Pipeline vẫn thử tối đa ba lần, cắt đuôi lặp nếu phát hiện được và dùng Whisper để chọn bản tốt nhất; nếu Whisper nhận sai hoặc không nhận ra giọng đã tạo, bản audio hợp lệ vẫn được dùng. Chỉ lỗi tạo audio thật sự mới dừng job. Bản này cũng đổi cache TTS để không tái sử dụng kết quả theo thuật toán cũ.
 
 Bản 1.5.9 xử lý lỗi câu đọc cần 1,52 giây nhưng chỉ có 0,40 giây trong timeline, áp dụng cho cả giọng có sẵn và giọng clone. Bạn có thể chọn kéo dài hình để giữ giọng tự nhiên hoặc tăng tốc giọng để giữ thời lượng video.
 

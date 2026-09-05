@@ -29,7 +29,7 @@ class PipelineError(RuntimeError):
 _whisper_model = None
 _omnivoice_model = None
 _ocr_model = None
-TTS_CACHE_VERSION = 9
+TTS_CACHE_VERSION = 10
 MIN_AUTO_SPEED = .75
 MAX_AUTO_SPEED = 1.08
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
@@ -841,12 +841,17 @@ def synthesize_verified_clone(
                 best_path, best_score = candidate, score
             if score >= .86:
                 break
-        if best_path is not None and best_score >= .86:
+        # Whisper is only a ranking signal here. With short Vietnamese cues and
+        # cloned timbres it can misrecognize a perfectly usable take (often at
+        # scores around .50). A false negative must not make the whole render
+        # impossible: keep the best generated take after the retries. Repeated
+        # tails are still removed above, and timing is handled afterwards.
+        if best_path is not None:
             shutil.copyfile(best_path, raw)
             return best_score, False
         raise PipelineError(
             "VOICE_FAILED",
-            f"Giọng clone đã chọn không đọc đúng cue sau {attempts} lần thử (score {best_score:.2f}); không tự đổi sang giọng khác.",
+            "Không tạo được audio từ giọng clone đã chọn.",
         )
     finally:
         for candidate in candidates:
