@@ -3,7 +3,7 @@ import { cookieSummary, deleteClone, listClones, saveClone } from "./storage.js"
 import { readPageMedia } from "./page-media.js";
 
 const $ = (selector) => document.querySelector(selector);
-const EXPECTED_API_VERSION = "1.5.8";
+const EXPECTED_API_VERSION = "1.5.9";
 const pageParams = new URLSearchParams(location.search);
 const isManualEditorPage = pageParams.get("manualEditor") === "1";
 const isReviewPlayerPage = pageParams.get("reviewPlayer") === "1";
@@ -15,7 +15,7 @@ const editor = new CanvasEditor($("#preview-canvas"));
 const state = {
   canonicalUrl: "", sourceTabId: null, mediaUrl: null, userAgent: "", server: null, jobId: null, stage: "idle", blurMode: "auto",
   clones: [], voices: [], analysis: null, pending: null, pollTimer: null, recoveryCount: 0, downloadId: null,
-  speechRate: 1, previewRate: null, immutableReviews: false, renderConfig: null, uploadedClones: {},
+  speechRate: 1, timingMode: "extend_video", previewRate: null, immutableReviews: false, renderConfig: null, uploadedClones: {},
   reviewResume: null, voiceCount: 1, voiceSelections: {},
 };
 
@@ -26,6 +26,7 @@ function reviewSnapshot(shouldPlay = null) {
     currentTime: Number.isFinite(video.currentTime) ? video.currentTime : 0,
     shouldPlay: shouldPlay ?? (!video.paused && !video.ended),
     speechRate: state.speechRate,
+    timingMode: state.timingMode,
     createdAt: Date.now(),
   };
 }
@@ -57,6 +58,7 @@ function setBusy(busy) {
   $("#primary").disabled = busy;
   $("#cancel").hidden = !busy || !state.jobId;
   $("#speech-rate").disabled = busy;
+  $("#timing-mode").disabled = busy;
   $("#voice-count").disabled = busy || Boolean(state.jobId);
   document.querySelectorAll("[data-blur-mode]").forEach((button) => { button.disabled = busy; });
 }
@@ -104,6 +106,7 @@ async function setupVideoPreview() {
 function showSpeedCard() {
   $("#speed-card").hidden = false;
   $("#speech-rate").value = String(state.speechRate);
+  $("#timing-mode").value = state.timingMode;
   $("#speech-rate-value").textContent = `${state.speechRate.toFixed(2)}×`;
 }
 
@@ -141,6 +144,7 @@ async function showDubbingReview() {
   }
   state.previewRate = Number(review.speechRate);
   state.speechRate = state.previewRate;
+  state.timingMode = review.timingMode || state.timingMode;
   state.reviewResume = null;
   state.stage = "preview_ready";
   showSpeedCard();
@@ -165,7 +169,7 @@ function invalidateDubbingReview() {
   video.hidden = true;
   $("#open-large-review").hidden = true;
   $("#primary").textContent = "Tạo lại preview 30 giây";
-  setStatus(`Tốc độ ${state.speechRate.toFixed(2)}× chưa được preview. Hãy tạo lại 30 giây để nghe thử.`, 55);
+  setStatus(`Cấu hình giọng ở ${state.speechRate.toFixed(2)}× đã thay đổi. Hãy tạo lại preview để nghe thử trước khi xuất.`, 55);
   persistJob().catch(() => {});
 }
 
@@ -392,7 +396,7 @@ async function persistJob() {
   return chrome.storage.session.set({ activeJob: {
     jobId: state.jobId, canonicalUrl: state.canonicalUrl, sourceTabId: state.sourceTabId, stage: state.stage,
     blurMode: state.blurMode, voiceCount: state.voiceCount,
-    recoveryCount: state.recoveryCount, speechRate: state.speechRate,
+    recoveryCount: state.recoveryCount, speechRate: state.speechRate, timingMode: state.timingMode,
     renderConfig: state.renderConfig, updatedAt: Date.now(),
   } });
 }
@@ -462,7 +466,7 @@ async function ensureServer(action) {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.8 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.9 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
@@ -685,7 +689,7 @@ async function render(previewOnly) {
       method: "POST",
       body: JSON.stringify({
         voiceMap: selections, blurRegions, subtitleRect,
-        speechRate: state.speechRate, previewOnly,
+        speechRate: state.speechRate, timingMode: state.timingMode, previewOnly,
       }),
       signal: AbortSignal.timeout(120000),
     });
@@ -761,6 +765,7 @@ async function initialize() {
     state.stage = session.activeJob?.stage || "idle";
     state.recoveryCount = session.activeJob?.recoveryCount || 0;
     state.speechRate = Number(session.activeJob?.speechRate || 1);
+    state.timingMode = session.activeJob?.timingMode || "extend_video";
     state.renderConfig = session.activeJob?.renderConfig || null;
     state.pending = session.pendingAction?.action || null;
     document.querySelectorAll("[data-blur-mode]").forEach((button) => button.classList.toggle("active", button.dataset.blurMode === state.blurMode));
@@ -797,7 +802,7 @@ async function initialize() {
         state.renderConfig = null;
         await chrome.storage.session.remove("activeJob");
         setBusy(true);
-        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.8 và tạo lại preview sạch…", 2);
+        setStatus("Đã phát hiện Colab cũ. Đang khởi động backend 1.5.9 và tạo lại preview sạch…", 2);
         ensureServer("analyze").catch((restartError) => {
           setBusy(false);
           setStatus(friendlyError(restartError));
@@ -855,6 +860,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "session" || !isReviewPlayerPage || handoff?.jobId !== state.jobId) return;
   state.reviewResume = handoff;
   state.speechRate = Number(handoff.speechRate || state.speechRate);
+  state.timingMode = handoff.timingMode || state.timingMode;
   showSpeedCard();
   const video = $("#review-video");
   if (video.hidden || !Number.isFinite(handoff.currentTime)) return;
@@ -895,6 +901,10 @@ $("#speech-rate").addEventListener("input", (event) => {
   auditionSpeechRate();
 });
 $("#speech-rate").addEventListener("change", commitAuditionedSpeechRate);
+$("#timing-mode").addEventListener("change", (event) => {
+  state.timingMode = event.target.value;
+  invalidateDubbingReview();
+});
 $("#speaker-voices").addEventListener("change", () => {
   rememberVoiceSelections();
   state.renderConfig = null;

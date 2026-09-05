@@ -132,7 +132,7 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   const sessionWrites = [];
   const event = () => ({ addListener: () => {} });
   const context = {
-    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.8" }) }),
+    fetch: async () => ({ ok: healthOk, json: async () => ({ apiVersion: "1.5.9" }) }),
     AbortSignal: { timeout: () => ({}) },
     setTimeout: (callback) => { callback(); return 1; },
     chrome: {
@@ -177,8 +177,8 @@ async function testServiceWorkerReinjectsExistingColabTab() {
   };
   vm.runInNewContext(fs.readFileSync("extension/service-worker.js", "utf8"), context);
   assert.equal(typeof updateAvailableListener, "function");
-  await updateAvailableListener({ version: "1.5.8" });
-  assert.ok(sessionWrites.some((value) => value.extensionUpdate?.version === "1.5.8"));
+  await updateAvailableListener({ version: "1.5.9" });
+  assert.ok(sessionWrites.some((value) => value.extensionUpdate?.version === "1.5.9"));
   const response = await new Promise((resolve) => {
     assert.equal(runtimeListener({ type: "OPEN_COLAB" }, {}, resolve), true);
   });
@@ -274,7 +274,7 @@ async function testReviewLoadingHandlesErrorsAndResetsPlaybackSpeed() {
     const state = { speechRate: 1.4, reviewResume: null };
     const context = {
       state, $: (selector) => selector === "#review-video" ? video : {},
-      serverFetch: async () => ({ url: "https://preview.example", speechRate: 1, seconds: 30 }),
+      serverFetch: async () => ({ url: "https://preview.example", speechRate: 1, seconds: 30, timingMode: "fit_audio" }),
       setTimeout: (fn) => { timeoutCallback = fn; return 42; },
       clearTimeout: (id) => { assert.equal(id, 42); cleared = true; },
       showSpeedCard() {}, setBusy() {}, setStatus() {}, persistJob: async () => {},
@@ -284,6 +284,7 @@ async function testReviewLoadingHandlesErrorsAndResetsPlaybackSpeed() {
       await context.showDubbingReview();
       assert.equal(state.stage, "preview_ready");
       assert.equal(state.speechRate, 1);
+      assert.equal(state.timingMode, "fit_audio");
     } else {
       await assert.rejects(context.showDubbingReview(), /Không tải được preview/);
     }

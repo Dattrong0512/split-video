@@ -1,6 +1,6 @@
 const NOTEBOOK_URL = "https://colab.research.google.com/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb";
 const NOTEBOOK_PATH = "/github/Dattrong0512/split-video/blob/main/OmniVoice_API.ipynb";
-const EXPECTED_API_VERSION = "1.5.8";
+const EXPECTED_API_VERSION = "1.5.9";
 let openingColab = null;
 const pendingColabTabs = new Set();
 const activeDownloads = new Set();

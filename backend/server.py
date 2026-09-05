@@ -27,7 +27,7 @@ JOBS: dict[str, dict] = {}
 VOICES: dict[str, dict] = {}
 LOCK = threading.RLock()
 
-app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.5.8", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Douyin Vietnamese Dubbing", version="1.5.9", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
@@ -46,7 +46,7 @@ def public_job(job: dict) -> dict:
     private = {
         "gemini_key", "cookie_text", "media_url", "browser_user_agent", "download_token", "download_expires",
         "preview_token", "preview_expires", "review_token", "review_expires", "review_links",
-        "work_dir", "source", "browser_preview", "cues", "result", "review_result", "tts_cache", "background",
+        "work_dir", "source", "browser_preview", "cues", "result", "review_result", "tts_cache", "background", "video_retiming",
     }
     return {key: value for key, value in job.items() if key not in private}
 
@@ -83,7 +83,7 @@ def run_render(job_id: str, request: RenderRequest) -> None:
 @app.get("/api/health", dependencies=[Depends(authorize)])
 def health() -> dict:
     return {
-        "ok": True, "apiVersion": "1.5.8",
+        "ok": True, "apiVersion": "1.5.9",
         "immutableReviews": True,
         "voices": [
             {"id": "edge:vi-VN-HoaiMyNeural", "name": "Hoài My · Nữ"},
@@ -207,8 +207,8 @@ def create_review_token(job_id: str) -> dict:
     for expired in [key for key, value in links.items() if value["expires"] < now]:
         del links[expired]
     links[token] = {"path": result, "expires": now + 7200}
-    return {"url": f"{PUBLIC_URL}/api/reviews/{job_id}?token={token}", "seconds": min(30, float(job["duration"])),
-            "speechRate": job.get("review_rate", 1.0)}
+    return {"url": f"{PUBLIC_URL}/api/reviews/{job_id}?token={token}", "seconds": job.get("review_duration", min(30, float(job["duration"]))),
+            "speechRate": job.get("review_rate", 1.0), "timingMode": job.get("review_timing_mode", "extend_video")}
 
 
 @app.get("/api/reviews/{job_id}")

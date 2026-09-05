@@ -26,7 +26,7 @@ class ServerContractTest(unittest.TestCase):
     def test_health_lists_vietnamese_presets(self):
         response = self.client.get("/api/health", headers=self.auth)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["apiVersion"], "1.5.8")
+        self.assertEqual(response.json()["apiVersion"], "1.5.9")
         self.assertTrue(response.json()["immutableReviews"])
         self.assertEqual([voice["id"] for voice in response.json()["voices"]], [
             "edge:vi-VN-HoaiMyNeural", "edge:vi-VN-NamMinhNeural"
@@ -150,10 +150,15 @@ class ServerContractTest(unittest.TestCase):
                 self.assertEqual(created.status_code, 200)
                 self.assertEqual(created.json()["seconds"], 30)
                 self.assertEqual(created.json()["speechRate"], 1.15)
+                self.assertEqual(created.json()["timingMode"], "extend_video")
                 url = created.json()["url"].removeprefix(server.PUBLIC_URL)
                 review = self.client.get(url)
                 self.assertEqual(review.status_code, 200)
                 self.assertEqual(review.content, b"review-video")
+                server.JOBS[job_id].update(review_duration=12.5, review_timing_mode="fit_audio")
+                updated = self.client.post(f"/api/jobs/{job_id}/review-token", headers=self.auth).json()
+                self.assertEqual(updated["seconds"], 12.5)
+                self.assertEqual(updated["timingMode"], "fit_audio")
             finally:
                 server.JOBS.pop(job_id, None)
 

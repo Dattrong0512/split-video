@@ -41,12 +41,14 @@
     </section>
     <section id="speed-card" class="card" hidden>
       <div class="section-title"><span>Nghe thử 30 giây</span><output id="speech-rate-value">1.00×</output></div>
+      <label for="timing-mode">Khi lời Việt dài hơn đoạn gốc</label>
+      <select id="timing-mode"><option value="extend_video">Giữ giọng tự nhiên · kéo dài đoạn hình</option><option value="fit_audio">Giữ thời lượng video · tăng tốc giọng</option></select>
       <label for="speech-rate">Tốc độ giọng Việt</label>
       <input id="speech-rate" class="speed-range" type="range" min="0.8" max="1.4" step="0.05" value="1">
       <div class="range-labels"><span>Chậm 0.80×</span><span>Nhanh 1.40×</span></div>
       <video id="review-video" controls playsinline preload="metadata" hidden></video>
       <button id="open-large-review" class="secondary full" type="button" hidden>Mở preview lớn trong tab riêng</button>
-      <small id="speed-help">Kéo thanh để nghe thay đổi ngay. Khi bạn thả thanh, extension tự tạo lại preview chính xác với video giữ nguyên tốc độ trước khi cho phép xuất toàn bộ.</small>
+      <small id="speed-help">Mặc định giữ giọng tự nhiên và kéo dài đoạn hình bị thiếu thời gian; video có thể dài hơn bản gốc. Chọn giữ thời lượng nếu cần video dài đúng bản gốc. Thả thanh tốc độ để tạo lại preview chính xác.</small>
     </section>
     <section class="card status-card"><div class="progress"><i id="progress-bar"></i></div><p id="status">Sẵn sàng.</p><button id="primary" class="primary">Phân tích video</button><button id="cancel" class="secondary full" hidden>Hủy</button></section>
   </main>

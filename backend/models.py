@@ -33,6 +33,7 @@ class RenderRequest(BaseModel):
     subtitleRect: Rect
     speechRate: float = Field(default=1.0, ge=.8, le=1.4)
     previewOnly: bool = False
+    timingMode: Literal["extend_video", "fit_audio"] = "extend_video"
 
     @model_validator(mode="after")
     def reasonable_size(self):
